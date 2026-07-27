@@ -125,18 +125,3 @@ its home directory) — remove one manually with `userdel` if needed.
 - Host key regeneration invalidates `known_hosts` on every existing client.
 - Password SSH auth is disabled — make sure your key is installed and
   working before you close your session.
-
-## Troubleshooting
-
-**ntfy notifications don't arrive:**
-- Confirm `curl` is installed (`which curl`).
-- Test the hook directly — note `sudo VAR=x cmd` strips prefixed env vars
-  (`env_reset`), so use `env` instead:
-  ```bash
-  env PAM_TYPE=open_session PAM_USER=test HOSTNAME=$(hostname) PAM_RHOST=1.2.3.4 \
-    bash -x /usr/bin/ntfy-ssh-login.sh
-  ```
-- Check `grep pam_exec /etc/pam.d/sshd` and `sshd -T | grep -i usepam`.
-- If your ntfy server sits behind Cloudflare (or similar), check for
-  country/IP restrictions on the zone — they can block the request
-  silently with no error in `auth.log`.
