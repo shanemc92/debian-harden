@@ -4,9 +4,9 @@ Interactive hardening and auto-cleanup setup for Debian-based systems
 (Debian, Ubuntu, Raspberry Pi OS). Asks a handful of questions up front,
 then applies everything unattended.
 
-![config-screenshot](docs/config-screenshot.png)
+![config-screenshot](docs/screenshot-config.png)
 
-![result-screenshot](docs/result-screenshot.png)
+![result-screenshot](docs/screenshot-result.png)
 
 
 ## What it does
