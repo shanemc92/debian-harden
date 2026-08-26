@@ -4,16 +4,13 @@ Interactive hardening and auto-cleanup setup for Debian-based systems
 (Debian, Ubuntu, Raspberry Pi OS). Asks a handful of questions up front,
 then applies everything unattended.
 
-![config-screenshot](docs/screenshot-config.png)
-
-![result-screenshot](docs/screenshot-result.png)
-
-
 ## What it does
 
 - Updates system packages, installs `curl` as a base dependency
 - Creates a sudo user and/or installs an SSH public key
-- Fixes Raspberry Pi OS's default passwordless sudo, if present
+- Audits sudo access: requires a password anywhere `NOPASSWD` is granted
+  (not just the Raspberry Pi OS default), and sets a password for any
+  sudo-group account that's locked or has none
 - Sets the timezone
 - Enables `unattended-upgrades`
 - Hardens SSH via a drop-in config (`/etc/ssh/sshd_config.d/99-harden.conf`):
@@ -119,6 +116,13 @@ its home directory) — remove one manually with `userdel` if needed.
   fields in `login.defs` — it applies to future password changes and new
   accounts, never retroactively, so it can't expire or lock out your
   current session.
+- Safe to re-run: config files are fully rewritten (not appended to) each
+  run, package/user/PAM-line checks skip what's already there, and UFW
+  drops its previously-added SSH rule before adding the current one — so
+  changing your answers (e.g. a different SSH port) on a second run
+  doesn't leave stale config or open ports behind. Host key backups are
+  only seeded once, so re-running with host key regeneration enabled
+  won't overwrite the true original keys with an already-regenerated set.
 
 ## Warnings
 
@@ -137,4 +141,6 @@ its home directory) — remove one manually with `userdel` if needed.
     bash -x /usr/bin/ntfy-ssh-login.sh
   ```
 - Check `grep pam_exec /etc/pam.d/sshd` and `sshd -T | grep -i usepam`.
-
+- If your ntfy server sits behind Cloudflare (or similar), check for
+  country/IP restrictions on the zone — they can block the request
+  silently with no error in `auth.log`.

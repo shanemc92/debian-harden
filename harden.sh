@@ -247,16 +247,43 @@ setup_user() {
 }
 
 # ------------------------------------------------------------------------
-# 4. Raspbian NOPASSWD sudoers fix
+# 4. Sudo access audit — any NOPASSWD grant, and any sudo-group account
+#    without a usable password
 # ------------------------------------------------------------------------
-fix_pi_nopasswd() {
-    local f="/etc/sudoers.d/010_pi-nopasswd"
-    [[ -f "$f" ]] || return 0
-    if confirm "Found $f (Raspberry Pi OS default) — require a password for sudo?" "y"; then
-        backup_file "$f"
-        sed -i 's/NOPASSWD:/PASSWD:/' "$f"
-        info "Updated $f to require a password for sudo."
-    fi
+audit_sudo_access() {
+    local files
+    files=$(grep -rl "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)
+    for f in $files; do
+        [[ -f "$f" ]] || continue
+        if confirm "Found NOPASSWD entries in $f — require a password there too?" "y"; then
+            backup_file "$f"
+            sed -i 's/NOPASSWD:/PASSWD:/' "$f"
+            info "Updated $f to require a password for sudo."
+        fi
+    done
+
+    local sudo_members
+    sudo_members=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' ' ')
+    for u in $sudo_members; do
+        [[ -z "$u" ]] && continue
+        local status; status=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
+        case "$status" in
+            L)
+                if confirm "User '$u' has sudo access but their password is LOCKED — unlock and set one now?" "y"; then
+                    passwd -u "$u" && passwd "$u"
+                fi
+                ;;
+            NP)
+                if confirm "User '$u' has sudo access but NO password is set — set one now?" "y"; then
+                    passwd "$u"
+                fi
+                ;;
+            P)
+                info "User '$u' (sudo access) already has a usable password." ;;
+            *)
+                warn "Could not determine password status for '$u'." ;;
+        esac
+    done
 }
 
 # ------------------------------------------------------------------------
@@ -333,7 +360,11 @@ setup_ssh() {
 
     if [[ "$REGEN_HOSTKEYS" == "y" ]]; then
         mkdir -p /etc/ssh/host-key-backup
-        cp -a /etc/ssh/ssh_host_* /etc/ssh/host-key-backup/ 2>/dev/null
+        if [[ -z "$(ls -A /etc/ssh/host-key-backup 2>/dev/null)" ]]; then
+            cp -a /etc/ssh/ssh_host_* /etc/ssh/host-key-backup/ 2>/dev/null
+        else
+            info "host-key-backup already has the original keys — leaving it as-is."
+        fi
         rm -f /etc/ssh/ssh_host_*
         ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N "" &>/dev/null
         ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" &>/dev/null
@@ -391,6 +422,20 @@ setup_ufw() {
 
     ufw default deny incoming
     ufw default allow outgoing
+
+    # Drop any SSH rule this script added on a previous run before adding
+    # the current one — otherwise a changed port/CIDR leaves the old one
+    # open alongside the new one.
+    ufw_remove_tagged() {
+        local tag="$1" num
+        while true; do
+            num=$(ufw status numbered 2>/dev/null | grep -F "$tag" | tail -n1 | grep -oE '^\[ *[0-9]+\]' | tr -d '[] ')
+            [[ -z "$num" ]] && break
+            ufw --force delete "$num" &>/dev/null
+        done
+    }
+    ufw_remove_tagged "SSH (LAN)"
+    ufw_remove_tagged "SSH (rate-limited)"
 
     if [[ "$ENV_TYPE" == "internal" ]]; then
         IFS=',' read -ra cidrs <<< "$LAN_CIDRS"
@@ -691,7 +736,7 @@ main() {
     preflight
     gather_config
     setup_user
-    fix_pi_nopasswd
+    audit_sudo_access
     setup_root_lock
     setup_timezone
     setup_unattended_upgrades

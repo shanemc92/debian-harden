@@ -256,16 +256,20 @@ revert_password_policy() {
 # ------------------------------------------------------------------------
 # 11. Raspberry Pi passwordless sudo
 # ------------------------------------------------------------------------
-revert_pi_nopasswd() {
-    local f="/etc/sudoers.d/010_pi-nopasswd"
-    [[ -f "${f}.harden-bak" ]] || return 0
+revert_sudoers_nopasswd() {
+    local files f
+    files=$(find /etc/sudoers /etc/sudoers.d/ -maxdepth 1 -name '*.harden-bak' 2>/dev/null)
+    [[ -n "$files" ]] || return 0
 
-    echo
-    if confirm "Restore passwordless sudo (Raspberry Pi OS default)? This lowers security." "n"; then
-        restore_backup "$f"
-        info "Passwordless sudo restored."
-        note_change
-    fi
+    for bak in $files; do
+        f="${bak%.harden-bak}"
+        echo
+        if confirm "Restore passwordless sudo from ${f} (undo the password requirement harden.sh added)? This lowers security." "n"; then
+            restore_backup "$f"
+            info "Restored NOPASSWD sudo access from ${f}."
+            note_change
+        fi
+    done
 }
 
 # ------------------------------------------------------------------------
@@ -325,7 +329,7 @@ main() {
     revert_sysctl_strict
     revert_auditd
     revert_password_policy
-    revert_pi_nopasswd
+    revert_sudoers_nopasswd
     revert_ntfy_hook
     revert_cleanup
 
