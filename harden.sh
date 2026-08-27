@@ -114,6 +114,7 @@ preflight() {
     apt-get update -y || warn "apt-get update failed — check network/sources.list."
     apt-get upgrade -y || warn "apt-get upgrade failed — continuing anyway."
     pkg_install curl || warn "curl failed to install — ntfy notifications will not work without it."
+    pkg_install cron || warn "cron failed to install — scheduled cleanup and the fail2ban ntfy summary will not run without it."
 }
 
 # ------------------------------------------------------------------------
@@ -269,8 +270,8 @@ audit_sudo_access() {
         local status; status=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
         case "$status" in
             L)
-                if confirm "User '$u' has sudo access but their password is LOCKED — unlock and set one now?" "y"; then
-                    passwd -u "$u" && passwd "$u"
+                if confirm "User '$u' has sudo access but their password is locked/unset — set a real password now? (this replaces the lock with a working password)" "y"; then
+                    passwd "$u" || warn "Could not set a password for '$u'."
                 fi
                 ;;
             NP)
@@ -683,7 +684,7 @@ EOF
 EOF
     info "logrotate policy written (rotate=${LOGROTATE_WEEKS} weeks)."
 
-    systemctl restart cron 2>/dev/null || warn "Could not restart cron — check 'systemctl status cron'."
+    systemctl enable --now cron 2>/dev/null || warn "Could not enable/start cron — check 'systemctl status cron'."
 }
 
 # ------------------------------------------------------------------------
