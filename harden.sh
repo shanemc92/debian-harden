@@ -199,6 +199,32 @@ gather_config() {
         BANNER_TEXT=$(ask "Banner text" "$BANNER_TEXT")
     fi
 
+    UU_CHECK_INTERVAL=$(ask "How often to check for updates (days)" "1")
+    UU_LEVEL=$(ask "Install automatically: security / all / none" "security")
+    case "$UU_LEVEL" in
+        security|all|none) : ;;
+        *) warn "Unrecognised value '$UU_LEVEL' — defaulting to 'security'."; UU_LEVEL="security" ;;
+    esac
+
+    UU_INSTALL_TIME="03:00"
+    UU_AUTO_REBOOT="n"
+    UU_REBOOT_TIME="03:30"
+    UU_NTFY_URL=""
+    if [[ "$UU_LEVEL" != "none" ]]; then
+        UU_INSTALL_TIME=$(ask "Time to run the daily update/install (24h HH:MM)" "03:00")
+        [[ "$UU_INSTALL_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { warn "Invalid time '$UU_INSTALL_TIME' — defaulting to 03:00."; UU_INSTALL_TIME="03:00"; }
+
+        if confirm "Allow an automatic reboot if one is required after updates?" "n"; then
+            UU_AUTO_REBOOT="y"
+            UU_REBOOT_TIME=$(ask "Automatic reboot time (24h HH:MM)" "03:30")
+            [[ "$UU_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { warn "Invalid time '$UU_REBOOT_TIME' — defaulting to 03:30."; UU_REBOOT_TIME="03:30"; }
+        fi
+
+        if confirm "Send an ntfy summary after each run (packages available/patched, reboot status)? Uses its own topic, separate from SSH-login/fail2ban alerts." "y"; then
+            UU_NTFY_URL=$(ask "ntfy topic URL for update summaries" "")
+        fi
+    fi
+
     TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "7d")
     TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "")
 
@@ -302,16 +328,93 @@ setup_timezone() {
 # 6. Unattended upgrades
 # ------------------------------------------------------------------------
 setup_unattended_upgrades() {
+    if [[ "$UU_LEVEL" == "none" ]]; then
+        info "Automatic upgrades set to 'none' — skipping unattended-upgrades setup."
+        return 0
+    fi
+
     pkg_install unattended-upgrades apt-listchanges
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
+
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+APT::Periodic::Update-Package-Lists "${UU_CHECK_INTERVAL}";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+    {
+        echo "// Managed by harden.sh"
+        echo "#clear Unattended-Upgrade::Allowed-Origins;"
+        echo "Unattended-Upgrade::Allowed-Origins {"
+        echo '    "${distro_id}:${distro_codename}-security";'
+        echo '    "${distro_id}ESMApps:${distro_codename}-apps-security";'
+        echo '    "${distro_id}ESMApps:${distro_codename}-infra-security";'
+        if [[ "$UU_LEVEL" == "all" ]]; then
+            echo '    "${distro_id}:${distro_codename}";'
+            echo '    "${distro_id}:${distro_codename}-updates";'
+        fi
+        echo "};"
+        echo
+        if [[ "$UU_AUTO_REBOOT" == "y" ]]; then
+            echo 'Unattended-Upgrade::Automatic-Reboot "true";'
+            echo "Unattended-Upgrade::Automatic-Reboot-Time \"${UU_REBOOT_TIME}\";"
+        else
+            echo 'Unattended-Upgrade::Automatic-Reboot "false";'
+        fi
+    } > /etc/apt/apt.conf.d/51harden-unattended-upgrades
+    info "Wrote update level (${UU_LEVEL}) and reboot policy to /etc/apt/apt.conf.d/51harden-unattended-upgrades."
+
+    # Pin the actual daily upgrade run to the chosen time — the stock
+    # systemd timer runs in a randomized morning/evening window otherwise.
+    mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
+    cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<EOF
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* ${UU_INSTALL_TIME}:00
+RandomizedDelaySec=0
+Persistent=true
+EOF
+    systemctl daemon-reload
+    if systemctl restart apt-daily-upgrade.timer 2>/dev/null; then
+        info "Daily upgrade run scheduled for ${UU_INSTALL_TIME}."
+    else
+        warn "Could not restart apt-daily-upgrade.timer — check 'systemctl status apt-daily-upgrade.timer'."
+    fi
+
     if systemctl enable --now unattended-upgrades &>/dev/null; then
-        info "unattended-upgrades enabled."
+        info "unattended-upgrades enabled (level=${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d)."
     else
         warn "Could not enable unattended-upgrades service — check 'systemctl status unattended-upgrades'."
+    fi
+
+    if [[ -n "$UU_NTFY_URL" ]]; then
+        mkdir -p /usr/bin/scripts
+        cat > /usr/bin/scripts/uu-ntfy-summary.sh <<EOF
+#!/bin/bash
+LOG=/var/log/unattended-upgrades/unattended-upgrades.log
+TODAY=\$(date +%Y-%m-%d)
+PATCHED=0
+if [[ -f "\$LOG" ]]; then
+    PATCHED=\$(grep "\$TODAY" "\$LOG" | grep "Packages that will be upgraded:" | tail -n1 | sed 's/.*upgraded: //' | wc -w)
+fi
+AVAILABLE=\$(apt list --upgradable 2>/dev/null | grep -c upgradable)
+REBOOT="no"
+[[ -f /var/run/reboot-required ]] && REBOOT="yes"
+curl -s -H p:3 -H title:"Unattended Upgrades" \\
+    -d "\$(hostname): \${PATCHED} patched, \${AVAILABLE} still upgradable, reboot required: \${REBOOT}" \\
+    "${UU_NTFY_URL}"
+EOF
+        chmod +x /usr/bin/scripts/uu-ntfy-summary.sh
+
+        # Schedule the summary 15 minutes after the install time.
+        local ih im
+        IFS=: read -r ih im <<< "$UU_INSTALL_TIME"
+        im=$((10#$im + 15)); ih=$((10#$ih))
+        if (( im >= 60 )); then im=$((im - 60)); ih=$((ih + 1)); fi
+        if (( ih >= 24 )); then ih=$((ih - 24)); fi
+        local summary_time; printf -v summary_time "%02d:%02d" "$ih" "$im"
+
+        ( crontab -l 2>/dev/null | grep -v 'uu-ntfy-summary.sh' ; echo "${im} ${ih} * * * /usr/bin/scripts/uu-ntfy-summary.sh" ) | crontab -
+        info "Scheduled unattended-upgrades ntfy summary for ${summary_time}."
     fi
 }
 
@@ -697,7 +800,11 @@ print_summary() {
     echo "  SSH port:           ${SSH_PORT}  (PasswordAuth disabled, PermitRootLogin disabled)"
     echo "  UFW:                enabled, default deny incoming"
     echo "  Fail2ban:           enabled on sshd jail"
-    echo "  Unattended upgrades: enabled"
+    if [[ "$UU_LEVEL" == "none" ]]; then
+        echo "  Unattended upgrades: disabled"
+    else
+        echo "  Unattended upgrades: ${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d, installs at ${UU_INSTALL_TIME}, auto-reboot=${UU_AUTO_REBOOT}, ntfy summary=$( [[ -n "$UU_NTFY_URL" ]] && echo y || echo n )"
+    fi
     echo "  Sysctl hardening:   ${SYSCTL_HARDEN} (network) / ${STRICT_SYSCTL} (kernel)"
     echo "  Ntfy notifications: ${ENABLE_NTFY}"
     echo "  Root account:       ${LOCK_ROOT} (locked)"

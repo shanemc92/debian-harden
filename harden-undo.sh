@@ -151,8 +151,13 @@ revert_unattended_upgrades() {
     echo
     if confirm "Disable automatic unattended upgrades?" "n"; then
         systemctl disable --now unattended-upgrades &>/dev/null
-        rm -f /etc/apt/apt.conf.d/20auto-upgrades
-        info "Unattended upgrades disabled."
+        rm -f /etc/apt/apt.conf.d/20auto-upgrades /etc/apt/apt.conf.d/51harden-unattended-upgrades
+        rm -rf /etc/systemd/system/apt-daily-upgrade.timer.d
+        systemctl daemon-reload
+        systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
+        rm -f /usr/bin/scripts/uu-ntfy-summary.sh
+        crontab -l 2>/dev/null | grep -v 'uu-ntfy-summary.sh' | crontab - 2>/dev/null || true
+        info "Unattended upgrades disabled and custom config/timer/cron removed."
         note_change
     fi
 }

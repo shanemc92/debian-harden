@@ -16,7 +16,13 @@ then applies everything unattended.
   (not just the Raspberry Pi OS default), and sets a password for any
   sudo-group account that's locked or has none
 - Sets the timezone
-- Enables `unattended-upgrades`
+- Configures `unattended-upgrades`: check interval, update level
+  (security-only / all / none), a fixed daily install time (default
+  03:00, via a systemd timer override rather than the default randomized
+  window), optional automatic reboot with its own scheduled time, and an
+  optional ntfy summary after each run (packages patched, still
+  upgradable, reboot-required) — on its own topic, separate from the
+  SSH-login/fail2ban alerts
 - Hardens SSH via a drop-in config (`/etc/ssh/sshd_config.d/99-harden.conf`):
   custom port, no root login, no password auth, optional strict
   cipher/KEX/MAC set, optional host key regeneration
@@ -52,7 +58,7 @@ new connection on the new port before closing your current session.**
 ### Run directly from GitHub or a self-hosted server
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/shanemc92/debian-harden/main/harden.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/harden.sh)"
 # or
 sudo bash -c "$(wget -qO- https://your-server.example.com/harden.sh)"
 ```
