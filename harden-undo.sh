@@ -261,6 +261,42 @@ revert_password_policy() {
 # ------------------------------------------------------------------------
 # 11. Raspberry Pi passwordless sudo
 # ------------------------------------------------------------------------
+revert_journald_persistent() {
+    [[ -f /etc/systemd/journald.conf.d/99-harden.conf ]] || return 0
+
+    echo
+    if confirm "Revert persistent journald logging (back to volatile//default)?" "n"; then
+        rm -f /etc/systemd/journald.conf.d/99-harden.conf
+        systemctl restart systemd-journald 2>/dev/null || warn "Could not restart systemd-journald."
+        info "Journald persistence reverted."
+        note_change
+    fi
+}
+
+revert_ufw_logging() {
+    command -v ufw &>/dev/null || return 0
+    ufw status verbose 2>/dev/null | grep -qi "^Logging: on" || return 0
+
+    echo
+    if confirm "Turn off UFW logging?" "n"; then
+        ufw logging off
+        info "UFW logging disabled."
+        note_change
+    fi
+}
+
+revert_rootkit_scanners() {
+    [[ -f /usr/bin/scripts/rootkit-scan.sh ]] || return 0
+
+    echo
+    if confirm "Remove the weekly rkhunter/chkrootkit scan (keeps the packages installed)?" "n"; then
+        rm -f /usr/bin/scripts/rootkit-scan.sh
+        crontab -l 2>/dev/null | grep -v 'rootkit-scan.sh' | crontab - 2>/dev/null || true
+        info "Weekly rootkit scan removed."
+        note_change
+    fi
+}
+
 revert_sudoers_nopasswd() {
     local files f
     files=$(find /etc/sudoers /etc/sudoers.d/ -maxdepth 1 -name '*.harden-bak' 2>/dev/null)
@@ -334,6 +370,9 @@ main() {
     revert_sysctl_strict
     revert_auditd
     revert_password_policy
+    revert_journald_persistent
+    revert_ufw_logging
+    revert_rootkit_scanners
     revert_sudoers_nopasswd
     revert_ntfy_hook
     revert_cleanup

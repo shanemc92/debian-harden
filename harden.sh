@@ -21,16 +21,121 @@ export NEEDRESTART_MODE=a
 # Helpers
 # ------------------------------------------------------------------------
 LOG_PREFIX="[harden]"
+DRY_RUN=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n)
+            DRY_RUN=1
+            LOG_PREFIX="[harden][dry-run]"
+            ;;
+        --help|-h)
+            cat <<'USAGE'
+harden.sh - interactive Debian/Ubuntu hardening and auto-cleanup setup.
+
+Usage: sudo bash harden.sh [--dry-run]
+
+  --dry-run, -n   Ask all the same questions and report exactly what would
+                  change, without modifying anything or installing packages.
+  --help, -h      Show this message.
+USAGE
+            exit 0
+            ;;
+    esac
+done
+
 info()  { echo "${LOG_PREFIX} $*"; }
 warn()  { echo "${LOG_PREFIX} WARNING: $*" >&2; }
 err()   { echo "${LOG_PREFIX} ERROR: $*" >&2; }
+
+# run <description> -- <command...>
+# Executes the command normally, or just reports it under --dry-run.
+run() {
+    local desc="$1"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would: ${desc}"
+        return 0
+    fi
+    "$@"
+}
+
+# write_file <path> — reads content from stdin. Reports under --dry-run.
+write_file() {
+    local path="$1"
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would write: ${path}"
+        cat > /dev/null
+        return 0
+    fi
+    cat > "$path"
+}
+
+# Under --dry-run, shadow every mutating command with a stub that reports
+# what it would have done and succeeds. Read-only invocations that the
+# script depends on for its logic (systemctl list-unit-files, ufw status,
+# passwd -S, crontab -l, apt-get update) are passed through to the real
+# binary so the dry run still follows the same code paths as a real one.
+if (( DRY_RUN )); then
+    _report() { echo "${LOG_PREFIX} would run: $*"; }
+
+    systemctl() {
+        case "${1:-}" in
+            list-unit-files|status|show|is-active|is-enabled) command systemctl "$@" ;;
+            *) _report "systemctl $*" ;;
+        esac
+    }
+    ufw() {
+        case "${1:-}" in
+            status) command ufw "$@" ;;
+            *) _report "ufw $*" ;;
+        esac
+    }
+    passwd() {
+        case "${1:-}" in
+            -S) command passwd "$@" ;;
+            *) _report "passwd $*" ;;
+        esac
+    }
+    crontab() {
+        if [[ "${1:-}" == "-l" ]]; then command crontab "$@"; else _report "crontab $*"; cat > /dev/null; fi
+    }
+    apt-get() {
+        case "${1:-}" in
+            update) command apt-get "$@" ;;
+            *) _report "apt-get $*" ;;
+        esac
+    }
+    sed() {
+        # Only -i (in-place) mutates; everything else is a normal filter.
+        if [[ "${1:-}" == "-i" ]]; then _report "sed $*"; else command sed "$@"; fi
+    }
+    timedatectl() {
+        case "${1:-}" in
+            set-timezone) _report "timedatectl $*" ;;
+            *) command timedatectl "$@" ;;
+        esac
+    }
+    cp()         { _report "cp $*"; }
+    mv()         { _report "mv $*"; }
+    rm()         { _report "rm $*"; }
+    mkdir()      { _report "mkdir $*"; }
+    chmod()      { _report "chmod $*"; }
+    chown()      { _report "chown $*"; }
+    touch()      { _report "touch $*"; }
+    adduser()    { _report "adduser $*"; }
+    usermod()    { _report "usermod $*"; }
+    ssh-keygen() { _report "ssh-keygen $*"; }
+    augenrules() { _report "augenrules $*"; }
+    sysctl()     { if [[ "${1:-}" == "--system" ]]; then _report "sysctl $*"; else command sysctl "$@"; fi; }
+fi
 
 ask() {
     # ask "Prompt text" "default" -> echoes the answer
     # Reads from /dev/tty, not stdin — so this still works when the script
     # itself is being piped in via `curl ... | bash` (stdin is the pipe in
     # that case, not the keyboard).
-    local prompt="$1" default="${2:-}" reply
+    local prompt="$1" default="${2:-}" reply=""
     if [[ -n "$default" ]]; then
         read -rp "${prompt} [${default}]: " reply < /dev/tty
         echo "${reply:-$default}"
@@ -42,7 +147,7 @@ ask() {
 
 confirm() {
     # confirm "Prompt text" "y|n" -> return 0 for yes, 1 for no
-    local prompt="$1" default="${2:-n}" reply
+    local prompt="$1" default="${2:-n}" reply=""
     local hint="y/N"
     [[ "$default" == "y" ]] && hint="Y/n"
     read -rp "${prompt} [${hint}]: " reply < /dev/tty
@@ -53,6 +158,10 @@ confirm() {
 backup_file() {
     local f="$1"
     if [[ -f "$f" && ! -f "${f}.harden-bak" ]]; then
+        if (( DRY_RUN )); then
+            echo "${LOG_PREFIX} would back up: $f -> ${f}.harden-bak"
+            return 0
+        fi
         cp -a "$f" "${f}.harden-bak"
         info "Backed up $f -> ${f}.harden-bak"
     fi
@@ -65,6 +174,11 @@ pkg_install() {
     for pkg in "$@"; do
         if dpkg -s "$pkg" &>/dev/null; then
             info "Package already installed: $pkg"
+            ok=$((ok+1))
+            continue
+        fi
+        if (( DRY_RUN )); then
+            echo "${LOG_PREFIX} would install: $pkg"
             ok=$((ok+1))
             continue
         fi
@@ -110,6 +224,9 @@ detect_os() {
 preflight() {
     require_root
     detect_os
+    if (( DRY_RUN )); then
+        info "DRY RUN — no changes will be made. Every action is reported instead."
+    fi
     info "Running apt update && upgrade first..."
     apt-get update -y || warn "apt-get update failed — check network/sources.list."
     apt-get upgrade -y || warn "apt-get upgrade failed — continuing anyway."
@@ -143,8 +260,10 @@ gather_config() {
     info "Environment set to: $ENV_TYPE"
 
     LAN_CIDRS=""
+    F2B_IGNOREIP=""
     if [[ "$ENV_TYPE" == "internal" ]]; then
         LAN_CIDRS=$(ask "Comma-separated CIDR ranges allowed to reach SSH (e.g. 192.168.1.0/24,192.168.2.0/24)" "192.168.1.0/24")
+        F2B_IGNOREIP=$(ask "IP(s) fail2ban should never ban (space-separated, e.g. your admin workstation)" "")
     fi
 
     CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
@@ -221,9 +340,30 @@ gather_config() {
         fi
 
         if confirm "Send an ntfy summary after each run (packages available/patched, reboot status)? Uses its own topic, separate from SSH-login/fail2ban alerts." "y"; then
-            UU_NTFY_URL=$(ask "ntfy topic URL for update summaries" "")
+            UU_NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "")
         fi
     fi
+
+    JOURNALD_PERSIST="n"
+    confirm "Make systemd journal logs persistent across reboots?" "y" && JOURNALD_PERSIST="y"
+
+    UFW_LOGGING="n"
+    confirm "Enable UFW firewall logging?" "y" && UFW_LOGGING="y"
+
+    SSH_EXTRA_LIMITS="n"
+    confirm "Apply extra SSH limits (MaxAuthTries, LoginGraceTime, ClientAliveInterval)?" "y" && SSH_EXTRA_LIMITS="y"
+
+    RUN_SSHAUDIT="n"
+    confirm "Run ssh-audit against localhost after hardening to verify the config?" "y" && RUN_SSHAUDIT="y"
+
+    RUN_LYNIS="n"
+    confirm "Run a Lynis audit at the end and report the hardening index?" "y" && RUN_LYNIS="y"
+
+    RUN_DEBSUMS="n"
+    confirm "Verify installed package files against their checksums (debsums)?" "y" && RUN_DEBSUMS="y"
+
+    ENABLE_ROOTKIT="n"
+    confirm "Install rkhunter + chkrootkit with a weekly scan?" "y" && ENABLE_ROOTKIT="y"
 
     TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "7d")
     TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "")
@@ -260,10 +400,22 @@ setup_user() {
     [[ -z "$SSH_PUBKEY" ]] && return 0
 
     local home_dir; home_dir=$(getent passwd "$target_user" | cut -d: -f6)
+    if [[ -z "$home_dir" || "$home_dir" == "/" ]]; then
+        if (( DRY_RUN )); then
+            echo "${LOG_PREFIX} would add the public key to ${target_user}'s authorized_keys (user doesn't exist yet in this dry run)"
+        else
+            warn "Could not determine a home directory for '${target_user}' — skipping SSH key setup."
+        fi
+        return 0
+    fi
     mkdir -p "${home_dir}/.ssh"
     touch "${home_dir}/.ssh/authorized_keys"
     if ! grep -qF "$SSH_PUBKEY" "${home_dir}/.ssh/authorized_keys" 2>/dev/null; then
-        echo "$SSH_PUBKEY" >> "${home_dir}/.ssh/authorized_keys"
+        if (( DRY_RUN )); then
+            echo "${LOG_PREFIX} would append public key to ${home_dir}/.ssh/authorized_keys"
+        else
+            echo "$SSH_PUBKEY" >> "${home_dir}/.ssh/authorized_keys"
+        fi
         info "Added public key to ${home_dir}/.ssh/authorized_keys"
     else
         info "Public key already present — skipping."
@@ -279,7 +431,7 @@ setup_user() {
 # ------------------------------------------------------------------------
 audit_sudo_access() {
     local files
-    files=$(grep -rl "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null || true)
+    files=$(grep -rl "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v '\.harden-bak$' || true)
     for f in $files; do
         [[ -f "$f" ]] || continue
         if confirm "Found NOPASSWD entries in $f — require a password there too?" "y"; then
@@ -298,11 +450,6 @@ audit_sudo_access() {
             L)
                 if confirm "User '$u' has sudo access but their password is locked/unset — set a real password now? (this replaces the lock with a working password)" "y"; then
                     passwd "$u" || warn "Could not set a password for '$u'."
-                fi
-                ;;
-            NP)
-                if confirm "User '$u' has sudo access but NO password is set — set one now?" "y"; then
-                    passwd "$u"
                 fi
                 ;;
             P)
@@ -335,7 +482,7 @@ setup_unattended_upgrades() {
 
     pkg_install unattended-upgrades apt-listchanges
 
-    cat > /etc/apt/apt.conf.d/20auto-upgrades <<EOF
+    write_file /etc/apt/apt.conf.d/20auto-upgrades <<EOF
 APT::Periodic::Update-Package-Lists "${UU_CHECK_INTERVAL}";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
@@ -360,13 +507,13 @@ EOF
         else
             echo 'Unattended-Upgrade::Automatic-Reboot "false";'
         fi
-    } > /etc/apt/apt.conf.d/51harden-unattended-upgrades
+    } | write_file /etc/apt/apt.conf.d/51harden-unattended-upgrades
     info "Wrote update level (${UU_LEVEL}) and reboot policy to /etc/apt/apt.conf.d/51harden-unattended-upgrades."
 
     # Pin the actual daily upgrade run to the chosen time — the stock
     # systemd timer runs in a randomized morning/evening window otherwise.
     mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
-    cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<EOF
+    write_file /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<EOF
 [Timer]
 OnCalendar=
 OnCalendar=*-*-* ${UU_INSTALL_TIME}:00
@@ -388,7 +535,7 @@ EOF
 
     if [[ -n "$UU_NTFY_URL" ]]; then
         mkdir -p /usr/bin/scripts
-        cat > /usr/bin/scripts/uu-ntfy-summary.sh <<EOF
+        write_file /usr/bin/scripts/uu-ntfy-summary.sh <<EOF
 #!/bin/bash
 LOG=/var/log/unattended-upgrades/unattended-upgrades.log
 TODAY=\$(date +%Y-%m-%d)
@@ -440,8 +587,15 @@ setup_ssh() {
         echo "PubkeyAuthentication yes"
         echo "PasswordAuthentication no"
         echo "PermitRootLogin no"
+        if [[ "$SSH_EXTRA_LIMITS" == "y" ]]; then
+            echo "MaxAuthTries 3"
+            echo "LoginGraceTime 30"
+            echo "ClientAliveInterval 300"
+            echo "ClientAliveCountMax 2"
+            echo "X11Forwarding no"
+        fi
         if [[ "$SSH_BANNER" == "y" ]]; then
-            echo "$BANNER_TEXT" > /etc/issue.net
+            (( DRY_RUN )) || echo "$BANNER_TEXT" > /etc/issue.net
             echo "Banner /etc/issue.net"
         fi
         if [[ "$SSHAUDIT_HARDEN" == "y" ]]; then
@@ -450,15 +604,19 @@ setup_ssh() {
             echo "MACs hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com"
             echo "HostKeyAlgorithms ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,rsa-sha2-256,rsa-sha2-512,rsa-sha2-256-cert-v01@openssh.com,rsa-sha2-512-cert-v01@openssh.com"
         fi
-    } > "$dropin"
+    } | write_file "$dropin"
     info "Wrote SSH hardening drop-in: $dropin"
 
     if [[ "$SSHAUDIT_HARDEN" == "y" ]]; then
         if [[ -f /etc/ssh/moduli ]]; then
+            if (( DRY_RUN )); then
+                echo "${LOG_PREFIX} would filter weak DH moduli in /etc/ssh/moduli"
+            else
             awk '$5 >= 3071' /etc/ssh/moduli > /etc/ssh/moduli.safe 2>/dev/null \
                 && mv -f /etc/ssh/moduli.safe /etc/ssh/moduli \
                 && info "Removed weak Diffie-Hellman moduli." \
                 || warn "Could not filter /etc/ssh/moduli — skipping."
+            fi
         fi
     fi
 
@@ -476,7 +634,9 @@ setup_ssh() {
     fi
 
     # Validate before restarting — never restart on a config that fails to parse.
-    if sshd -t 2>/tmp/harden-sshd-test.log; then
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would validate with 'sshd -t' and restart SSH on port ${SSH_PORT}"
+    elif sshd -t 2>/tmp/harden-sshd-test.log; then
         info "sshd config validated OK."
         if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
             info "SSH restarted on port ${SSH_PORT}."
@@ -492,7 +652,7 @@ setup_ssh() {
     fi
 
     if [[ "$ENABLE_NTFY" == "y" ]]; then
-        cat > /usr/bin/ntfy-ssh-login.sh <<EOF
+        write_file /usr/bin/ntfy-ssh-login.sh <<EOF
 #!/bin/bash
 if [ "\${PAM_TYPE}" = "open_session" ]; then
   curl -s \\
@@ -508,7 +668,7 @@ EOF
             {
                 echo "# Ntfy notification on login (added by harden.sh)"
                 echo "session optional pam_exec.so /usr/bin/ntfy-ssh-login.sh"
-            } >> /etc/pam.d/sshd
+            } | { if (( DRY_RUN )); then echo "${LOG_PREFIX} would append ntfy PAM hook to /etc/pam.d/sshd"; cat > /dev/null; else cat >> /etc/pam.d/sshd; fi; }
             info "Added ntfy SSH login alert to PAM."
         fi
     fi
@@ -528,8 +688,10 @@ setup_ufw() {
     ufw default allow outgoing
 
     # Drop any SSH rule this script added on a previous run before adding
-    # the current one — otherwise a changed port/CIDR leaves the old one
-    # open alongside the new one.
+    # the current one — otherwise a changed port, CIDR or environment type
+    # leaves the old rule open alongside the new one. All rules we add
+    # carry the [harden.sh] marker so they can be found regardless of what
+    # the port or source was on the previous run.
     ufw_remove_tagged() {
         local tag="$1" num
         while true; do
@@ -538,6 +700,8 @@ setup_ufw() {
             ufw --force delete "$num" &>/dev/null
         done
     }
+    ufw_remove_tagged "[harden.sh]"
+    # Legacy markers from earlier versions of this script.
     ufw_remove_tagged "SSH (LAN)"
     ufw_remove_tagged "SSH (rate-limited)"
 
@@ -546,10 +710,15 @@ setup_ufw() {
         for cidr in "${cidrs[@]}"; do
             cidr=$(echo "$cidr" | xargs)
             [[ -z "$cidr" ]] && continue
-            ufw limit from "$cidr" to any port "$SSH_PORT" comment "SSH (LAN)"
+            ufw limit from "$cidr" to any port "$SSH_PORT" comment "[harden.sh] SSH (LAN)"
         done
     else
-        ufw limit "${SSH_PORT}/tcp" comment "SSH (rate-limited)"
+        ufw limit "${SSH_PORT}/tcp" comment "[harden.sh] SSH (rate-limited)"
+    fi
+
+    if [[ "$UFW_LOGGING" == "y" ]]; then
+        ufw logging low
+        info "UFW logging enabled (low)."
     fi
 
     ufw --force enable
@@ -572,15 +741,15 @@ setup_fail2ban() {
     if [[ "$ENV_TYPE" == "internal" ]]; then
         bantime="300"
         [[ "$ENABLE_NTFY" == "y" ]] && banaction="ntfy"
-        local ignoreip
-        ignoreip=$(ask "IP(s) to always allow (space-separated, e.g. your admin workstation)" "")
-        [[ -n "$ignoreip" ]] && ignoreip_line="ignoreip = ${ignoreip}"
+        # Always keep localhost in the list — setting ignoreip at all
+        # overrides fail2ban's built-in default of 127.0.0.1/8 ::1.
+        ignoreip_line="ignoreip = 127.0.0.1/8 ::1${F2B_IGNOREIP:+ ${F2B_IGNOREIP}}"
     else
         banaction="iptables[type=allports]"
     fi
 
     if [[ "$banaction" == "ntfy" ]]; then
-        cat > /etc/fail2ban/action.d/ntfy.local <<EOF
+        write_file /etc/fail2ban/action.d/ntfy.local <<EOF
 [Definition]
 actionban = iptables -I f2b-<name> 1 -s <ip> -j <blocktype>
             curl -s -H p:4 -H tags:warning -H title:Fail2Ban -d "Blocked: <ip> on <fq-hostname>" "${NTFY_URL}"
@@ -605,7 +774,7 @@ EOF
         echo "findtime = 1800"
         echo "banaction = ${banaction}"
         echo "filter = sshd"
-    } > /etc/fail2ban/jail.local
+    } | write_file /etc/fail2ban/jail.local
     info "Wrote /etc/fail2ban/jail.local (bantime=${bantime}s, banaction=${banaction})."
 
     if systemctl enable --now fail2ban &>/dev/null; then
@@ -616,7 +785,7 @@ EOF
 
     if [[ "$ENV_TYPE" == "external" && "$ENABLE_NTFY" == "y" ]]; then
         mkdir -p /usr/bin/scripts
-        cat > /usr/bin/scripts/f2b-ntfy.sh <<EOF
+        write_file /usr/bin/scripts/f2b-ntfy.sh <<EOF
 #!/bin/bash
 export PATH=\$PATH:/usr/local/bin:/usr/bin:/bin
 banned=\$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP list:")
@@ -668,7 +837,7 @@ EOF
             echo
             echo "fs.suid_dumpable = 0"
         fi
-    } > /etc/sysctl.d/99-harden.conf
+    } | write_file /etc/sysctl.d/99-harden.conf
     if sysctl --system &>/tmp/harden-sysctl.log; then
         info "sysctl hardening applied."
     else
@@ -691,7 +860,7 @@ setup_root_lock() {
 
 setup_coredumps_limits() {
     [[ "$DISABLE_COREDUMPS" == "y" ]] || return 0
-    cat > /etc/security/limits.d/99-harden-nocore.conf <<'EOF'
+    write_file /etc/security/limits.d/99-harden-nocore.conf <<'EOF'
 # Managed by harden.sh
 * hard core 0
 EOF
@@ -702,7 +871,7 @@ setup_auditd() {
     [[ "$ENABLE_AUDITD" == "y" ]] || return 0
     if pkg_install auditd audispd-plugins; then
         mkdir -p /etc/audit/rules.d
-        cat > /etc/audit/rules.d/harden.rules <<'EOF'
+        write_file /etc/audit/rules.d/harden.rules <<'EOF'
 # Managed by harden.sh — watch key security-relevant files
 -w /etc/passwd -p wa -k harden-identity
 -w /etc/shadow -p wa -k harden-identity
@@ -757,13 +926,133 @@ setup_password_policy() {
 # ------------------------------------------------------------------------
 # 11. Auto-cleanup: ncdu, tmpreaper, logrotate
 # ------------------------------------------------------------------------
+# ------------------------------------------------------------------------
+# 11b. Persistent journald, rootkit scanning, and post-hardening audits
+# ------------------------------------------------------------------------
+setup_journald_persistent() {
+    [[ "$JOURNALD_PERSIST" == "y" ]] || return 0
+    mkdir -p /etc/systemd/journald.conf.d
+    write_file /etc/systemd/journald.conf.d/99-harden.conf <<'EOF'
+# Managed by harden.sh
+[Journal]
+Storage=persistent
+SystemMaxUse=500M
+SystemMaxFileSize=50M
+MaxRetentionSec=1month
+EOF
+    if systemctl restart systemd-journald 2>/dev/null; then
+        info "Journald logs are now persistent (capped at 500M / 1 month)."
+    else
+        warn "Could not restart systemd-journald — check 'systemctl status systemd-journald'."
+    fi
+}
+
+setup_rootkit_scanners() {
+    [[ "$ENABLE_ROOTKIT" == "y" ]] || return 0
+    pkg_install rkhunter chkrootkit || true
+
+    if command -v rkhunter &>/dev/null; then
+        run "rkhunter --propupd (baseline file properties)" -- rkhunter --propupd &>/dev/null
+    fi
+
+    write_file /usr/bin/scripts/rootkit-scan.sh <<EOF
+#!/bin/bash
+# Managed by harden.sh — weekly rootkit scan, alerts only on findings.
+LOG=/var/log/harden-rootkit-scan.log
+NTFY_URL="${NTFY_URL}"
+{
+  echo "=== \$(date) ==="
+  FINDINGS=0
+
+  if command -v rkhunter &>/dev/null; then
+      rkhunter --update --quiet 2>/dev/null
+      rkhunter --check --skip-keypress --report-warnings-only 2>&1 | tee /tmp/rkhunter.out
+      grep -qi "warning" /tmp/rkhunter.out && FINDINGS=\$((FINDINGS+1))
+  fi
+
+  if command -v chkrootkit &>/dev/null; then
+      chkrootkit 2>&1 | grep -i "INFECTED" > /tmp/chkrootkit.out
+      [[ -s /tmp/chkrootkit.out ]] && { cat /tmp/chkrootkit.out; FINDINGS=\$((FINDINGS+1)); }
+  fi
+
+  if [[ \$FINDINGS -gt 0 && -n "\$NTFY_URL" ]]; then
+      curl -s -H p:5 -H tags:rotating_light -H title:"Rootkit Scan ALERT" \\
+        -d "\$(hostname): rootkit scan reported findings — check \$LOG" "\$NTFY_URL"
+  fi
+  echo "Findings: \$FINDINGS"
+} >> "\$LOG" 2>&1
+EOF
+    chmod +x /usr/bin/scripts/rootkit-scan.sh
+
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would schedule weekly rootkit scan (Sundays 04:00)"
+    else
+        ( crontab -l 2>/dev/null | grep -v 'rootkit-scan.sh' ; echo "0 4 * * 0 /usr/bin/scripts/rootkit-scan.sh" ) | crontab -
+        info "Weekly rootkit scan scheduled (Sundays 04:00), alerts on findings only."
+    fi
+}
+
+run_debsums_check() {
+    [[ "$RUN_DEBSUMS" == "y" ]] || return 0
+    pkg_install debsums || return 0
+    command -v debsums &>/dev/null || return 0
+
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would run: debsums -s (package file integrity check)"
+        return 0
+    fi
+    info "Verifying package file integrity (this can take a minute)..."
+    local out; out=$(debsums -s 2>&1 | head -n 20)
+    if [[ -z "$out" ]]; then
+        info "debsums: all checked package files match their checksums."
+    else
+        warn "debsums reported modified/missing files:"
+        echo "$out"
+        warn "Config files are often modified legitimately — review before acting."
+    fi
+}
+
+run_ssh_audit() {
+    [[ "$RUN_SSHAUDIT" == "y" ]] || return 0
+    pkg_install ssh-audit || return 0
+    command -v ssh-audit &>/dev/null || { warn "ssh-audit not available — skipping verification."; return 0; }
+
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would run: ssh-audit localhost:${SSH_PORT}"
+        return 0
+    fi
+    info "Running ssh-audit against localhost:${SSH_PORT}..."
+    ssh-audit -p "${SSH_PORT}" localhost 2>&1 | tail -n 25 \
+        || warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT}."
+}
+
+run_lynis_audit() {
+    [[ "$RUN_LYNIS" == "y" ]] || return 0
+    pkg_install lynis || return 0
+    command -v lynis &>/dev/null || { warn "lynis not available — skipping audit."; return 0; }
+
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would run: lynis audit system --quick"
+        return 0
+    fi
+    info "Running Lynis audit (this takes a couple of minutes)..."
+    lynis audit system --quick --quiet &>/tmp/harden-lynis.log
+    local index; index=$(grep -i "hardening index" /tmp/harden-lynis.log | tail -n1)
+    if [[ -n "$index" ]]; then
+        info "Lynis ${index}"
+    else
+        info "Lynis audit complete."
+    fi
+    info "Full report: /var/log/lynis-report.dat (run output: /tmp/harden-lynis.log)"
+}
+
 setup_cleanup() {
     pkg_install ncdu logrotate || true
 
     if pkg_install tmpreaper; then
         local dirs="/tmp/. /var/tmp/."
         [[ -n "$TMPREAPER_EXTRA" ]] && dirs="${dirs} ${TMPREAPER_EXTRA}"
-        cat > /etc/tmpreaper.conf <<EOF
+        write_file /etc/tmpreaper.conf <<EOF
 # Managed by harden.sh
 TMPREAPER_TIME='${TMPREAPER_TIME}'
 TMPREAPER_PROTECT_EXTRA=''
@@ -774,7 +1063,7 @@ EOF
         info "tmpreaper configured (age=${TMPREAPER_TIME}, dirs='${dirs}')."
     fi
 
-    cat > /etc/logrotate.d/harden-varlog <<EOF
+    write_file /etc/logrotate.d/harden-varlog <<EOF
 /var/log/*.log {
     weekly
     missingok
@@ -784,8 +1073,54 @@ EOF
     notifempty
     create 0640 root root
 }
+
+# UFW logging is high-volume on an internet-facing host — rotate it
+# harder than the general policy above.
+/var/log/ufw.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 root adm
+    sharedscripts
+    postrotate
+        [ -x /usr/lib/rsyslog/rsyslog-rotate ] && /usr/lib/rsyslog/rsyslog-rotate || true
+    endscript
+}
+
+/var/log/harden-rootkit-scan.log {
+    monthly
+    missingok
+    rotate 6
+    compress
+    delaycompress
+    notifempty
+    create 0640 root root
+}
+
+/var/log/unattended-upgrades/*.log {
+    weekly
+    missingok
+    rotate ${LOGROTATE_WEEKS}
+    compress
+    delaycompress
+    notifempty
+    create 0640 root root
+}
+
+/var/log/lynis.log /var/log/lynis-report.dat {
+    monthly
+    missingok
+    rotate 3
+    compress
+    delaycompress
+    notifempty
+    create 0640 root root
+}
 EOF
-    info "logrotate policy written (rotate=${LOGROTATE_WEEKS} weeks)."
+    info "logrotate policy written (rotate=${LOGROTATE_WEEKS} weeks, plus ufw/rootkit/unattended-upgrades/lynis logs)."
 
     systemctl enable --now cron 2>/dev/null || warn "Could not enable/start cron — check 'systemctl status cron'."
 }
@@ -795,7 +1130,11 @@ EOF
 # ------------------------------------------------------------------------
 print_summary() {
     echo
-    info "=== Summary ==="
+    if (( DRY_RUN )); then
+        info "=== Summary (DRY RUN — nothing was changed) ==="
+    else
+        info "=== Summary ==="
+    fi
     echo "  Environment:        ${ENV_TYPE}"
     echo "  SSH port:           ${SSH_PORT}  (PasswordAuth disabled, PermitRootLogin disabled)"
     echo "  UFW:                enabled, default deny incoming"
@@ -810,6 +1149,10 @@ print_summary() {
     echo "  Root account:       ${LOCK_ROOT} (locked)"
     echo "  Core dumps:         ${DISABLE_COREDUMPS} (disabled)"
     echo "  auditd:             ${ENABLE_AUDITD}"
+    echo "  Persistent journal: ${JOURNALD_PERSIST}"
+    echo "  UFW logging:        ${UFW_LOGGING}"
+    echo "  Extra SSH limits:   ${SSH_EXTRA_LIMITS}"
+    echo "  Rootkit scanners:   ${ENABLE_ROOTKIT} (weekly, Sundays 04:00)"
     echo "  Password policy:    ${PASSWORD_POLICY}"
     echo "  Cleanup:            tmpreaper + logrotate configured"
     echo
@@ -856,7 +1199,12 @@ main() {
     setup_auditd
     setup_apparmor_check
     setup_password_policy
+    setup_journald_persistent
+    setup_rootkit_scanners
     setup_cleanup
+    run_debsums_check
+    run_ssh_audit
+    run_lynis_audit
     print_summary
 }
 

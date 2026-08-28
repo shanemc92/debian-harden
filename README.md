@@ -39,7 +39,16 @@ then applies everything unattended.
 - Enables `auditd` with watch rules on passwd/shadow/sudoers/sshd_config — optional
 - Checks AppArmor status and reports it (doesn't force changes) — optional
 - Applies a password quality/expiry policy — future password changes and new accounts only, never retroactive
-- Sets up `tmpreaper` and `logrotate` for automatic cleanup
+- Makes systemd journal logs persistent across reboots, capped at 500M / 1 month
+- Enables UFW logging
+- Adds extra SSH limits (`MaxAuthTries`, `LoginGraceTime`, `ClientAliveInterval`, no X11 forwarding)
+- Installs `rkhunter` + `chkrootkit` with a weekly scan (Sundays 04:00) that
+  only alerts via ntfy when it finds something — reuses the SSH-login/fail2ban topic
+- Verifies installed package files against their checksums with `debsums`
+- Runs `ssh-audit` against localhost afterwards to confirm the cipher config took
+- Runs a Lynis audit at the end and reports the hardening index
+- Sets up `tmpreaper` and `logrotate` for automatic cleanup, including the
+  UFW, rootkit-scan, unattended-upgrades and Lynis logs so they can't fill the disk
 
 ## Requirements
 
@@ -51,6 +60,15 @@ then applies everything unattended.
 ```bash
 sudo bash harden.sh
 ```
+
+To see exactly what would change without touching anything:
+
+```bash
+sudo bash harden.sh --dry-run
+```
+
+Dry-run asks all the same questions and reports every file write, package
+install and command it would run, then exits without making changes.
 
 Answer the prompts as they appear. At the end it restarts SSH — **test a
 new connection on the new port before closing your current session.**
