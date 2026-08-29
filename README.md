@@ -92,7 +92,7 @@ new connection on the new port before closing your current session.**
 ### Run directly from GitHub or a self-hosted server
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/shanemc92/debian-harden/main/harden.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/harden.sh)"
 # or
 sudo bash -c "$(wget -qO- https://your-server.example.com/harden.sh)"
 ```
@@ -162,6 +162,11 @@ remove one manually with `userdel` if needed.
   Raspberry Pi OS, older Ubuntu) this is skipped entirely. It also checks
   with `ss -ltn` afterward that something is actually listening on the
   configured port before declaring success.
+- The SSH drop-in sets `AddressFamily inet` (IPv4 only), so the
+  post-hardening `ssh-audit` verification connects to `127.0.0.1`
+  explicitly rather than `localhost` — on Ubuntu, `localhost` commonly
+  resolves to `::1` first, which would otherwise get refused before ever
+  trying the IPv4 address that actually works.
 - UFW's own rate-limiting (`ufw limit`) is used instead of raw iptables
   rules, to avoid two firewall layers fighting each other.
 - fail2ban gets a minimal `jail.local` (it merges over `jail.conf`

@@ -1185,14 +1185,14 @@ run_ssh_audit() {
     command -v ssh-audit &>/dev/null || { warn "ssh-audit not available — skipping verification."; return 0; }
 
     if (( DRY_RUN )); then
-        echo "${LOG_PREFIX} would run: ssh-audit localhost:${SSH_PORT}"
+        echo "${LOG_PREFIX} would run: ssh-audit 127.0.0.1:${SSH_PORT}"
         return 0
     fi
 
-    info "Running ssh-audit against localhost:${SSH_PORT}..."
+    info "Running ssh-audit against 127.0.0.1:${SSH_PORT}..."
     local tries=0 ok_run=0
     while (( tries < 3 )); do
-        if ssh-audit -p "${SSH_PORT}" localhost &>/tmp/harden-sshaudit.log; then
+        if ssh-audit -p "${SSH_PORT}" 127.0.0.1 &>/tmp/harden-sshaudit.log; then
             ok_run=1
             break
         fi
@@ -1203,15 +1203,19 @@ run_ssh_audit() {
     if (( ok_run )); then
         tail -n 25 /tmp/harden-sshaudit.log
     elif [[ "$SSH_PORT" != "22" ]]; then
-        warn "Could not reach SSH on port ${SSH_PORT} after a few tries — falling back to port 22 (in case the port change hasn't fully applied) just to verify the cipher config."
-        if ssh-audit -p 22 localhost &>/tmp/harden-sshaudit-22.log; then
+        warn "Could not reach SSH on port ${SSH_PORT} after a few tries:"
+        tail -n 5 /tmp/harden-sshaudit.log
+        warn "Falling back to port 22 (in case the port change hasn't fully applied) just to verify the cipher config."
+        if ssh-audit -p 22 127.0.0.1 &>/tmp/harden-sshaudit-22.log; then
             tail -n 25 /tmp/harden-sshaudit-22.log
             warn "That check ran against port 22, not ${SSH_PORT} — confirm SSH is actually listening on ${SSH_PORT} with 'ss -ltn'."
         else
-            warn "ssh-audit could not connect on port 22 either — check 'systemctl status ssh.socket ssh.service' and 'ss -ltn'."
+            warn "ssh-audit could not connect on port 22 either:"
+            tail -n 5 /tmp/harden-sshaudit-22.log
         fi
     else
-        warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT} with 'ss -ltn'."
+        warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT} with 'ss -ltn':"
+        tail -n 5 /tmp/harden-sshaudit.log
     fi
 }
 
