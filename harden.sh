@@ -743,8 +743,30 @@ setup_ssh() {
         echo "${LOG_PREFIX} would validate with 'sshd -t' and restart SSH on port ${SSH_PORT}"
     elif sshd -t 2>/tmp/harden-sshd-test.log; then
         info "sshd config validated OK."
+        local restart_ok=0
         if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
-            ok "SSH restarted on port ${SSH_PORT}."
+            restart_ok=1
+        fi
+        # On Ubuntu 22.10+/24.04+, SSH is socket-activated: ssh.socket owns
+        # the listening port, and restarting ssh.service alone does NOT
+        # move it — only a daemon-reload + ssh.socket restart does. Skip
+        # silently if this system doesn't use socket activation at all.
+        if systemctl list-unit-files ssh.socket &>/dev/null && systemctl is-enabled ssh.socket &>/dev/null; then
+            systemctl daemon-reload
+            if systemctl restart ssh.socket 2>/dev/null; then
+                info "Restarted ssh.socket (socket-activated SSH) so the port change takes effect."
+            else
+                warn "Could not restart ssh.socket — the port change may not have taken effect. Check 'systemctl status ssh.socket'."
+                restart_ok=0
+            fi
+        fi
+        if (( restart_ok )); then
+            sleep 1
+            if command -v ss &>/dev/null && ! ss -ltn 2>/dev/null | grep -q ":${SSH_PORT} "; then
+                warn "SSH restarted, but nothing appears to be listening on port ${SSH_PORT} yet — check 'ss -ltn' and 'systemctl status ssh.socket ssh.service' before disconnecting."
+            else
+                ok "SSH restarted on port ${SSH_PORT}."
+            fi
             warn "TEST a NEW SSH session on port ${SSH_PORT} now, before closing this one."
         else
             err "SSH service restart failed — check 'systemctl status ssh'."
@@ -1166,38 +1188,35 @@ run_ssh_audit() {
         echo "${LOG_PREFIX} would run: ssh-audit localhost:${SSH_PORT}"
         return 0
     fi
+
     info "Running ssh-audit against localhost:${SSH_PORT}..."
-    ssh-audit -p "${SSH_PORT}" localhost 2>&1 | tail -n 25 \
-        || warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT}."
+    local tries=0 ok_run=0
+    while (( tries < 3 )); do
+        if ssh-audit -p "${SSH_PORT}" localhost &>/tmp/harden-sshaudit.log; then
+            ok_run=1
+            break
+        fi
+        tries=$((tries+1))
+        sleep 2
+    done
+
+    if (( ok_run )); then
+        tail -n 25 /tmp/harden-sshaudit.log
+    elif [[ "$SSH_PORT" != "22" ]]; then
+        warn "Could not reach SSH on port ${SSH_PORT} after a few tries — falling back to port 22 (in case the port change hasn't fully applied) just to verify the cipher config."
+        if ssh-audit -p 22 localhost &>/tmp/harden-sshaudit-22.log; then
+            tail -n 25 /tmp/harden-sshaudit-22.log
+            warn "That check ran against port 22, not ${SSH_PORT} — confirm SSH is actually listening on ${SSH_PORT} with 'ss -ltn'."
+        else
+            warn "ssh-audit could not connect on port 22 either — check 'systemctl status ssh.socket ssh.service' and 'ss -ltn'."
+        fi
+    else
+        warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT} with 'ss -ltn'."
+    fi
 }
 
 LYNIS_BEFORE=""
 LYNIS_AFTER=""
-
-# lynis_summarize <report-file> — the raw report.dat is very verbose;
-# pull out just the hardening index plus a capped list of warnings and
-# suggestions instead of dumping the whole thing.
-lynis_summarize() {
-    local report="$1"
-    [[ -f "$report" ]] || { warn "Lynis report not found at $report"; return 0; }
-
-    local warn_count sugg_count
-    warn_count=$(grep -c '^warning\[\]=' "$report" 2>/dev/null || echo 0)
-    sugg_count=$(grep -c '^suggestion\[\]=' "$report" 2>/dev/null || echo 0)
-    info "Lynis found ${warn_count} warning(s) and ${sugg_count} suggestion(s)."
-
-    if (( warn_count > 0 )); then
-        echo "  Warnings:"
-        awk -F'|' '{sub(/^warning\[\]=/,"",$1); printf "    - [%s] %s\n", $1, $2}' "$report" | head -n 10
-        (( warn_count > 10 )) && echo "    ... and $((warn_count - 10)) more in the full report."
-    fi
-    if (( sugg_count > 0 )); then
-        echo "  Top suggestions:"
-        awk -F'|' '{sub(/^suggestion\[\]=/,"",$1); printf "    - [%s] %s\n", $1, $2}' "$report" | head -n 10
-        (( sugg_count > 10 )) && echo "    ... and $((sugg_count - 10)) more in the full report."
-    fi
-    info "Full report: ${report}"
-}
 
 run_lynis_baseline() {
     [[ "$RUN_LYNIS" == "y" ]] || return 0
@@ -1240,7 +1259,7 @@ run_lynis_audit() {
     else
         info "Lynis audit complete."
     fi
-    lynis_summarize /var/log/harden-lynis-after.dat
+    info "Full report: /var/log/harden-lynis-after.dat"
 }
 
 setup_cleanup() {

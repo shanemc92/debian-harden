@@ -16,9 +16,6 @@ otherwise — see [Design notes](#design-notes)).
 
 ![Summary output](docs/screenshot-summary.png)
 
-*(Replace the paths above with your own screenshots — e.g. drop them in
-a `docs/` folder in the repo, or point at any image URL.)*
-
 ## What it does
 
 - Updates system packages, installs `curl` as a base dependency
@@ -157,6 +154,14 @@ remove one manually with `userdel` if needed.
 - SSH changes go in a drop-in file, not edited into `sshd_config` directly.
   `sshd -t` validates the config before any restart; if validation fails,
   the drop-in is removed and the existing session is left untouched.
+- On Ubuntu 22.10+ (including 24.04 LTS), SSH is socket-activated:
+  `ssh.socket` owns the actual listening port, and restarting
+  `ssh.service` alone does **not** move it — only `systemctl daemon-reload`
+  followed by `systemctl restart ssh.socket` does. The script detects
+  socket activation and does both; on systems without it (Debian,
+  Raspberry Pi OS, older Ubuntu) this is skipped entirely. It also checks
+  with `ss -ltn` afterward that something is actually listening on the
+  configured port before declaring success.
 - UFW's own rate-limiting (`ufw limit`) is used instead of raw iptables
   rules, to avoid two firewall layers fighting each other.
 - fail2ban gets a minimal `jail.local` (it merges over `jail.conf`
