@@ -18,16 +18,31 @@ export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
 # ------------------------------------------------------------------------
+# Colour (auto-disabled when not on a terminal, NO_COLOR is set, or the
+# terminal doesn't support it — everything still works with plain text)
+# ------------------------------------------------------------------------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput &>/dev/null && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+    C_RESET=$(tput sgr0);   C_BOLD=$(tput bold);    C_DIM=$(tput dim)
+    C_RED=$(tput setaf 1);  C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
+    C_BLUE=$(tput setaf 4); C_MAGENTA=$(tput setaf 5); C_CYAN=$(tput setaf 6)
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+# ------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------
-LOG_PREFIX="[harden]"
+LOG_TAG="${C_CYAN}${C_BOLD}[harden]${C_RESET}"
+LOG_PREFIX="$LOG_TAG"
 DRY_RUN=0
 
 for arg in "$@"; do
     case "$arg" in
         --dry-run|-n)
             DRY_RUN=1
-            LOG_PREFIX="[harden][dry-run]"
+            LOG_TAG="${C_MAGENTA}${C_BOLD}[harden][dry-run]${C_RESET}"
+            LOG_PREFIX="$LOG_TAG"
             ;;
         --help|-h)
             cat <<'USAGE'
@@ -44,9 +59,34 @@ USAGE
     esac
 done
 
-info()  { echo "${LOG_PREFIX} $*"; }
-warn()  { echo "${LOG_PREFIX} WARNING: $*" >&2; }
-err()   { echo "${LOG_PREFIX} ERROR: $*" >&2; }
+info()  { echo -e "${LOG_PREFIX} $*"; }
+warn()  { echo -e "${LOG_PREFIX} ${C_YELLOW}${C_BOLD}WARNING:${C_RESET} $*" >&2; }
+err()   { echo -e "${LOG_PREFIX} ${C_RED}${C_BOLD}ERROR:${C_RESET} $*" >&2; }
+ok()    { echo -e "${LOG_PREFIX} ${C_GREEN}[OK]${C_RESET} $*"; }
+
+# section <title> — visual divider between the major phases of a run.
+section() {
+    local title=" $* " width cols rule
+    cols=$(tput cols 2>/dev/null || echo 60)
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=60
+    width=$(( cols < 40 ? 40 : (cols > 60 ? 60 : cols) ))
+    rule=$(printf '%*s' "$width" '' | tr ' ' '=')
+    echo
+    echo -e "${C_BLUE}${C_BOLD}${rule}${C_RESET}"
+    echo -e "${C_BLUE}${C_BOLD}${title}${C_RESET}"
+    echo -e "${C_BLUE}${C_BOLD}${rule}${C_RESET}"
+}
+
+# subsection <title> — lightweight heading used to group related prompts
+# within gather_config(), matching the names of the section() dividers
+# those answers get applied under later in the run.
+subsection() {
+    local title="$*" underline
+    underline=$(printf '%*s' "${#title}" '' | tr ' ' '-')
+    echo
+    echo -e "${C_BOLD}${title}${C_RESET}"
+    echo -e "${C_DIM}${underline}${C_RESET}"
+}
 
 # run <description> -- <command...>
 # Executes the command normally, or just reports it under --dry-run.
@@ -137,10 +177,10 @@ ask() {
     # that case, not the keyboard).
     local prompt="$1" default="${2:-}" reply=""
     if [[ -n "$default" ]]; then
-        read -rp "${prompt} [${default}]: " reply < /dev/tty
+        read -rp "${C_BOLD}${prompt}${C_RESET} ${C_DIM}[${default}]${C_RESET}: " reply < /dev/tty
         echo "${reply:-$default}"
     else
-        read -rp "${prompt}: " reply < /dev/tty
+        read -rp "${C_BOLD}${prompt}${C_RESET}: " reply < /dev/tty
         echo "${reply}"
     fi
 }
@@ -150,7 +190,7 @@ confirm() {
     local prompt="$1" default="${2:-n}" reply=""
     local hint="y/N"
     [[ "$default" == "y" ]] && hint="Y/n"
-    read -rp "${prompt} [${hint}]: " reply < /dev/tty
+    read -rp "${C_BOLD}${prompt}${C_RESET} ${C_DIM}[${hint}]${C_RESET}: " reply < /dev/tty
     reply="${reply:-$default}"
     [[ "$reply" =~ ^[Yy] ]]
 }
@@ -224,8 +264,9 @@ detect_os() {
 preflight() {
     require_root
     detect_os
+    section "Preflight"
     if (( DRY_RUN )); then
-        info "DRY RUN — no changes will be made. Every action is reported instead."
+        info "${C_MAGENTA}${C_BOLD}DRY RUN${C_RESET} — no changes will be made. Every action is reported instead."
     fi
     info "Running apt update && upgrade first..."
     apt-get update -y || warn "apt-get update failed — check network/sources.list."
@@ -238,9 +279,9 @@ preflight() {
 # 2. Gather configuration
 # ------------------------------------------------------------------------
 gather_config() {
-    echo
-    info "=== Configuration ==="
+    section "Configuration"
 
+    subsection "Account & Access"
     NEW_USER=$(ask "New sudo user to create (blank to skip)" "")
 
     SSH_PUBKEY=""
@@ -249,74 +290,22 @@ gather_config() {
         SSH_PUBKEY=$(ask "Paste the SSH public key (blank to skip)" "")
     fi
 
-    SSH_PORT=$(ask "SSH port to use" "22")
-
-    echo "Environment type:"
-    echo "  1) internal (LAN only, trusted network)"
-    echo "  2) external (internet-facing)"
-    local envchoice
-    envchoice=$(ask "Choose 1 or 2" "1")
-    if [[ "$envchoice" == "2" ]]; then ENV_TYPE="external"; else ENV_TYPE="internal"; fi
-    info "Environment set to: $ENV_TYPE"
-
-    LAN_CIDRS=""
-    F2B_IGNOREIP=""
-    if [[ "$ENV_TYPE" == "internal" ]]; then
-        LAN_CIDRS=$(ask "Comma-separated CIDR ranges allowed to reach SSH (e.g. 192.168.1.0/24,192.168.2.0/24)" "192.168.1.0/24")
-        F2B_IGNOREIP=$(ask "IP(s) fail2ban should never ban (space-separated, e.g. your admin workstation)" "")
-    fi
-
-    CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
-    TIMEZONE=$(ask "Timezone" "$CURRENT_TZ")
-
-    ENABLE_NTFY="n"
-    NTFY_URL=""
-    if confirm "Enable ntfy notifications (SSH logins + fail2ban bans)?" "n"; then
-        ENABLE_NTFY="y"
-        NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "")
-        [[ -z "$NTFY_URL" ]] && { warn "No URL given — disabling ntfy."; ENABLE_NTFY="n"; }
-    fi
-
-    SSHAUDIT_HARDEN="n"
-    confirm "Apply strict ssh-audit cipher/KEX/MAC hardening? (safe, recommended)" "y" && SSHAUDIT_HARDEN="y"
-
-    REGEN_HOSTKEYS="n"
-    if [[ "$ENV_TYPE" == "external" ]]; then
-        confirm "Regenerate SSH host keys? (invasive — invalidates known_hosts on all existing clients)" "n" && REGEN_HOSTKEYS="y"
-    fi
-
-    SYSCTL_HARDEN="n"
-    local sysctl_default="n"; [[ "$ENV_TYPE" == "external" ]] && sysctl_default="y"
-    confirm "Apply sysctl network hardening (anti-spoofing, disable redirects)?" "$sysctl_default" && SYSCTL_HARDEN="y"
-
-    STRICT_SYSCTL="n"
-    confirm "Apply stricter kernel sysctls (ASLR, dmesg/kptr restrict, TCP syncookies)?" "y" && STRICT_SYSCTL="y"
-
-    DISABLE_COREDUMPS="n"
-    confirm "Disable core dumps?" "y" && DISABLE_COREDUMPS="y"
-
     LOCK_ROOT="n"
     confirm "Lock the root account password (on top of disabling root SSH login)?" "y" && LOCK_ROOT="y"
 
-    ENABLE_AUDITD="n"
-    confirm "Enable auditd (logs changes to key files like passwd/shadow/sudoers)?" "y" && ENABLE_AUDITD="y"
-
-    CHECK_APPARMOR="n"
-    confirm "Check AppArmor status and report any unenforced profiles?" "y" && CHECK_APPARMOR="y"
-
-    PASSWORD_POLICY="n"
-    PW_MINLEN="12"
-    if confirm "Apply a password quality policy (applies to future password changes only, won't lock out current sessions)?" "y"; then
-        PASSWORD_POLICY="y"
-        PW_MINLEN=$(ask "Minimum password length" "12")
+    SHELL_TIMEOUT="n"
+    SHELL_TIMEOUT_SECS="900"
+    if confirm "Auto-logout idle interactive shells after 15 minutes?" "y"; then
+        SHELL_TIMEOUT="y"
+        SHELL_TIMEOUT_SECS=$(ask "Idle timeout in seconds" "900")
     fi
 
-    SSH_BANNER="n"
-    BANNER_TEXT="Authorized access only. All activity may be monitored and reported."
-    if confirm "Add an SSH pre-login banner?" "y"; then
-        SSH_BANNER="y"
-        BANNER_TEXT=$(ask "Banner text" "$BANNER_TEXT")
-    fi
+    subsection "System"
+    CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
+    TIMEZONE=$(ask "Timezone" "$CURRENT_TZ")
+
+    ENABLE_TIMESYNC="n"
+    confirm "Explicitly enable systemd-timesyncd for NTP (skipped if chrony/ntpd already active)?" "y" && ENABLE_TIMESYNC="y"
 
     UU_CHECK_INTERVAL=$(ask "How often to check for updates (days)" "1")
     UU_LEVEL=$(ask "Install automatically: security / all / none" "security")
@@ -344,31 +333,124 @@ gather_config() {
         fi
     fi
 
-    JOURNALD_PERSIST="n"
-    confirm "Make systemd journal logs persistent across reboots?" "y" && JOURNALD_PERSIST="y"
+    subsection "SSH"
+    SSH_PORT=$(ask "SSH port to use" "22")
+
+    echo "Environment type:"
+    echo "  1) internal (LAN only, trusted network)"
+    echo "  2) external (internet-facing)"
+    local envchoice
+    envchoice=$(ask "Choose 1 or 2" "1")
+    if [[ "$envchoice" == "2" ]]; then ENV_TYPE="external"; else ENV_TYPE="internal"; fi
+    info "Environment set to: $ENV_TYPE"
+
+    SSHAUDIT_HARDEN="n"
+    confirm "Apply strict ssh-audit cipher/KEX/MAC hardening? (safe, recommended)" "y" && SSHAUDIT_HARDEN="y"
+
+    REGEN_HOSTKEYS="n"
+    if [[ "$ENV_TYPE" == "external" ]]; then
+        confirm "Regenerate SSH host keys? (invasive — invalidates known_hosts on all existing clients)" "n" && REGEN_HOSTKEYS="y"
+    fi
+
+    SSH_BANNER="n"
+    BANNER_TEXT="Authorized access only. All activity may be monitored and reported."
+    if confirm "Add an SSH pre-login banner?" "y"; then
+        SSH_BANNER="y"
+        BANNER_TEXT=$(ask "Banner text" "$BANNER_TEXT")
+    fi
+
+    SSH_EXTRA_LIMITS="n"
+    SSH_MAX_AUTH_TRIES="3"
+    SSH_LOGIN_GRACE_TIME="30"
+    SSH_CLIENT_ALIVE_INTERVAL="300"
+    SSH_CLIENT_ALIVE_COUNT_MAX="2"
+    if confirm "Apply extra SSH limits (MaxAuthTries=${SSH_MAX_AUTH_TRIES}, LoginGraceTime=${SSH_LOGIN_GRACE_TIME}s, ClientAliveInterval=${SSH_CLIENT_ALIVE_INTERVAL}s, ClientAliveCountMax=${SSH_CLIENT_ALIVE_COUNT_MAX}, X11Forwarding=no)?" "y"; then
+        SSH_EXTRA_LIMITS="y"
+        if confirm "Use those defaults?" "y"; then
+            :
+        else
+            SSH_MAX_AUTH_TRIES=$(ask "MaxAuthTries (failed login attempts before disconnect)" "$SSH_MAX_AUTH_TRIES")
+            SSH_LOGIN_GRACE_TIME=$(ask "LoginGraceTime in seconds (time allowed to authenticate)" "$SSH_LOGIN_GRACE_TIME")
+            SSH_CLIENT_ALIVE_INTERVAL=$(ask "ClientAliveInterval in seconds (idle keepalive check)" "$SSH_CLIENT_ALIVE_INTERVAL")
+            SSH_CLIENT_ALIVE_COUNT_MAX=$(ask "ClientAliveCountMax (missed keepalives before disconnect)" "$SSH_CLIENT_ALIVE_COUNT_MAX")
+        fi
+    fi
+
+    subsection "Firewall"
+    LAN_CIDRS=""
+    if [[ "$ENV_TYPE" == "internal" ]]; then
+        LAN_CIDRS=$(ask "Comma-separated CIDR ranges allowed to reach SSH (e.g. 192.168.1.0/24,192.168.2.0/24)" "192.168.1.0/24")
+    fi
 
     UFW_LOGGING="n"
     confirm "Enable UFW firewall logging?" "y" && UFW_LOGGING="y"
 
-    SSH_EXTRA_LIMITS="n"
-    confirm "Apply extra SSH limits (MaxAuthTries, LoginGraceTime, ClientAliveInterval)?" "y" && SSH_EXTRA_LIMITS="y"
+    subsection "Intrusion Prevention"
+    ENABLE_NTFY="n"
+    NTFY_URL=""
+    if confirm "Enable ntfy notifications (SSH logins + fail2ban bans)?" "n"; then
+        ENABLE_NTFY="y"
+        NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "")
+        [[ -z "$NTFY_URL" ]] && { warn "No URL given — disabling ntfy."; ENABLE_NTFY="n"; }
+    fi
+
+    F2B_IGNOREIP=""
+    if [[ "$ENV_TYPE" == "internal" ]]; then
+        F2B_IGNOREIP=$(ask "IP(s) fail2ban should never ban (space-separated, e.g. your admin workstation)" "")
+    fi
+
+    subsection "Kernel & Resource Limits"
+    SYSCTL_HARDEN="n"
+    local sysctl_default="n"; [[ "$ENV_TYPE" == "external" ]] && sysctl_default="y"
+    confirm "Apply sysctl network hardening (anti-spoofing, disable redirects)?" "$sysctl_default" && SYSCTL_HARDEN="y"
+
+    STRICT_SYSCTL="n"
+    confirm "Apply stricter kernel sysctls (ASLR, dmesg/kptr restrict, TCP syncookies, disable sysrq, ICMP hardening)?" "y" && STRICT_SYSCTL="y"
+
+    DISABLE_COREDUMPS="n"
+    confirm "Disable core dumps?" "y" && DISABLE_COREDUMPS="y"
+
+    BLACKLIST_PROTOCOLS="n"
+    confirm "Blacklist rarely-used network protocols (dccp, sctp, rds, tipc)?" "y" && BLACKLIST_PROTOCOLS="y"
+
+    subsection "Auditing & Compliance"
+    ENABLE_AUDITD="n"
+    confirm "Enable auditd (logs changes to key files like passwd/shadow/sudoers)?" "y" && ENABLE_AUDITD="y"
+
+    CHECK_APPARMOR="n"
+    confirm "Check AppArmor status and report any unenforced profiles?" "y" && CHECK_APPARMOR="y"
+
+    PASSWORD_POLICY="n"
+    PW_MINLEN="12"
+    if confirm "Apply a password quality policy (applies to future password changes only, won't lock out current sessions)?" "y"; then
+        PASSWORD_POLICY="y"
+        PW_MINLEN=$(ask "Minimum password length" "12")
+    fi
+
+    JOURNALD_PERSIST="n"
+    confirm "Make systemd journal logs persistent across reboots?" "y" && JOURNALD_PERSIST="y"
+
+    ENABLE_ROOTKIT="n"
+    confirm "Install rkhunter + chkrootkit with a weekly scan?" "y" && ENABLE_ROOTKIT="y"
+
+    ENABLE_ACCOUNTING="n"
+    confirm "Enable process accounting and sysstat (acct + sysstat)?" "y" && ENABLE_ACCOUNTING="y"
+
+    subsection "Cleanup"
+    TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "7d")
+    TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "")
+
+    LOGROTATE_WEEKS=$(ask "How many weekly log rotations to keep in /var/log/*.log" "4")
+
+    subsection "Verification"
+    RUN_DEBSUMS="n"
+    confirm "Verify installed package files against their checksums (debsums)?" "y" && RUN_DEBSUMS="y"
 
     RUN_SSHAUDIT="n"
     confirm "Run ssh-audit against localhost after hardening to verify the config?" "y" && RUN_SSHAUDIT="y"
 
     RUN_LYNIS="n"
-    confirm "Run a Lynis audit at the end and report the hardening index?" "y" && RUN_LYNIS="y"
-
-    RUN_DEBSUMS="n"
-    confirm "Verify installed package files against their checksums (debsums)?" "y" && RUN_DEBSUMS="y"
-
-    ENABLE_ROOTKIT="n"
-    confirm "Install rkhunter + chkrootkit with a weekly scan?" "y" && ENABLE_ROOTKIT="y"
-
-    TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "7d")
-    TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "")
-
-    LOGROTATE_WEEKS=$(ask "How many weekly log rotations to keep in /var/log/*.log" "4")
+    confirm "Run Lynis before and after hardening to compare the hardening index and summarize findings?" "y" && RUN_LYNIS="y"
 
     echo
     info "Configuration collected. Proceeding — review each section's warnings as it runs."
@@ -471,6 +553,20 @@ setup_timezone() {
     fi
 }
 
+setup_timesync() {
+    [[ "$ENABLE_TIMESYNC" == "y" ]] || return 0
+    if systemctl is-active chrony &>/dev/null || systemctl is-active ntp &>/dev/null || systemctl is-active ntpd &>/dev/null; then
+        info "A time-sync daemon (chrony/ntpd) is already active — leaving it as-is."
+        return 0
+    fi
+    (( DRY_RUN )) && echo "${LOG_PREFIX} would run: systemctl enable --now systemd-timesyncd"
+    if systemctl enable --now systemd-timesyncd &>/dev/null; then
+        info "systemd-timesyncd enabled for NTP."
+    else
+        warn "Could not enable systemd-timesyncd — check 'systemctl status systemd-timesyncd'."
+    fi
+}
+
 # ------------------------------------------------------------------------
 # 6. Unattended upgrades
 # ------------------------------------------------------------------------
@@ -527,8 +623,9 @@ EOF
         warn "Could not restart apt-daily-upgrade.timer — check 'systemctl status apt-daily-upgrade.timer'."
     fi
 
+    (( DRY_RUN )) && echo "${LOG_PREFIX} would run: systemctl enable --now unattended-upgrades"
     if systemctl enable --now unattended-upgrades &>/dev/null; then
-        info "unattended-upgrades enabled (level=${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d)."
+        ok "unattended-upgrades enabled (level=${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d)."
     else
         warn "Could not enable unattended-upgrades service — check 'systemctl status unattended-upgrades'."
     fi
@@ -587,15 +684,23 @@ setup_ssh() {
         echo "PubkeyAuthentication yes"
         echo "PasswordAuthentication no"
         echo "PermitRootLogin no"
+        echo "PermitEmptyPasswords no"
+        echo "IgnoreRhosts yes"
         if [[ "$SSH_EXTRA_LIMITS" == "y" ]]; then
-            echo "MaxAuthTries 3"
-            echo "LoginGraceTime 30"
-            echo "ClientAliveInterval 300"
-            echo "ClientAliveCountMax 2"
+            echo "MaxAuthTries ${SSH_MAX_AUTH_TRIES}"
+            echo "LoginGraceTime ${SSH_LOGIN_GRACE_TIME}"
+            echo "ClientAliveInterval ${SSH_CLIENT_ALIVE_INTERVAL}"
+            echo "ClientAliveCountMax ${SSH_CLIENT_ALIVE_COUNT_MAX}"
             echo "X11Forwarding no"
         fi
         if [[ "$SSH_BANNER" == "y" ]]; then
-            (( DRY_RUN )) || echo "$BANNER_TEXT" > /etc/issue.net
+            if (( DRY_RUN )); then
+                echo "${LOG_PREFIX} would write banner to /etc/issue.net, /etc/issue, /etc/motd" >&2
+            else
+                echo "$BANNER_TEXT" > /etc/issue.net
+                echo "$BANNER_TEXT" > /etc/issue
+                echo "$BANNER_TEXT" > /etc/motd
+            fi
             echo "Banner /etc/issue.net"
         fi
         if [[ "$SSHAUDIT_HARDEN" == "y" ]]; then
@@ -639,7 +744,7 @@ setup_ssh() {
     elif sshd -t 2>/tmp/harden-sshd-test.log; then
         info "sshd config validated OK."
         if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
-            info "SSH restarted on port ${SSH_PORT}."
+            ok "SSH restarted on port ${SSH_PORT}."
             warn "TEST a NEW SSH session on port ${SSH_PORT} now, before closing this one."
         else
             err "SSH service restart failed — check 'systemctl status ssh'."
@@ -723,7 +828,7 @@ setup_ufw() {
 
     ufw --force enable
     ufw reload
-    info "UFW enabled — default deny incoming, SSH allowed on port ${SSH_PORT}."
+    ok "UFW enabled — default deny incoming, SSH allowed on port ${SSH_PORT}."
 }
 
 # ------------------------------------------------------------------------
@@ -777,8 +882,9 @@ EOF
     } | write_file /etc/fail2ban/jail.local
     info "Wrote /etc/fail2ban/jail.local (bantime=${bantime}s, banaction=${banaction})."
 
+    (( DRY_RUN )) && echo "${LOG_PREFIX} would run: systemctl enable --now fail2ban"
     if systemctl enable --now fail2ban &>/dev/null; then
-        info "fail2ban enabled and started."
+        ok "fail2ban enabled and started."
     else
         warn "Could not start fail2ban — check 'systemctl status fail2ban'."
     fi
@@ -788,9 +894,9 @@ EOF
         write_file /usr/bin/scripts/f2b-ntfy.sh <<EOF
 #!/bin/bash
 export PATH=\$PATH:/usr/local/bin:/usr/bin:/bin
-banned=\$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP list:")
+banned=\$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP list:" | sed -E 's/^[^A-Za-z]*Banned IP list:[[:space:]]*//')
 if [[ -n "\$banned" ]]; then
-  curl -s "${NTFY_URL}" -H ta:no_entry -H p:2 -H title:Fail2Ban -d "\$(hostname) \${banned}"
+  curl -s "${NTFY_URL}" -H ta:no_entry -H p:2 -H title:Fail2Ban -d "\$(hostname) banned IPs: \${banned}"
 fi
 EOF
         chmod +x /usr/bin/scripts/f2b-ntfy.sh
@@ -830,7 +936,10 @@ EOF
 kernel.randomize_va_space = 2
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
+kernel.sysrq = 0
 net.ipv4.tcp_syncookies = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
 EOF
         fi
         if [[ "$DISABLE_COREDUMPS" == "y" ]]; then
@@ -858,6 +967,16 @@ setup_root_lock() {
     fi
 }
 
+setup_shell_timeout() {
+    [[ "$SHELL_TIMEOUT" == "y" ]] || return 0
+    write_file /etc/profile.d/99-harden-tmout.sh <<EOF
+# Managed by harden.sh — auto-logout idle interactive login shells.
+TMOUT=${SHELL_TIMEOUT_SECS}
+export TMOUT
+EOF
+    info "Idle shell timeout set to ${SHELL_TIMEOUT_SECS}s (interactive login shells only)."
+}
+
 setup_coredumps_limits() {
     [[ "$DISABLE_COREDUMPS" == "y" ]] || return 0
     write_file /etc/security/limits.d/99-harden-nocore.conf <<'EOF'
@@ -865,6 +984,19 @@ setup_coredumps_limits() {
 * hard core 0
 EOF
     info "Core dumps disabled via limits.d (and fs.suid_dumpable via sysctl)."
+}
+
+setup_blacklist_protocols() {
+    [[ "$BLACKLIST_PROTOCOLS" == "y" ]] || return 0
+    write_file /etc/modprobe.d/harden-blacklist-protocols.conf <<'EOF'
+# Managed by harden.sh — prevent rarely-used network protocols from
+# being auto-loaded. Does not unload modules already in use.
+install dccp /bin/true
+install sctp /bin/true
+install rds /bin/true
+install tipc /bin/true
+EOF
+    info "Blacklisted dccp/sctp/rds/tipc from auto-loading."
 }
 
 setup_auditd() {
@@ -880,6 +1012,7 @@ setup_auditd() {
 -w /etc/ssh/sshd_config -p wa -k harden-sshd
 EOF
         augenrules --load &>/tmp/harden-auditd.log || warn "augenrules --load reported issues — see /tmp/harden-auditd.log."
+        (( DRY_RUN )) && echo "${LOG_PREFIX} would run: systemctl enable --now auditd"
         if systemctl enable --now auditd &>/dev/null; then
             info "auditd enabled with basic identity/SSH watch rules."
         else
@@ -992,6 +1125,18 @@ EOF
     fi
 }
 
+setup_accounting() {
+    [[ "$ENABLE_ACCOUNTING" == "y" ]] || return 0
+    pkg_install acct sysstat || true
+
+    if [[ -f /etc/default/sysstat ]]; then
+        sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat
+    fi
+    systemctl enable --now sysstat &>/dev/null || warn "Could not enable sysstat — check 'systemctl status sysstat'."
+    systemctl enable --now acct 2>/dev/null || service acct start 2>/dev/null || true
+    info "Process accounting (acct) and sysstat enabled."
+}
+
 run_debsums_check() {
     [[ "$RUN_DEBSUMS" == "y" ]] || return 0
     pkg_install debsums || return 0
@@ -1026,24 +1171,76 @@ run_ssh_audit() {
         || warn "ssh-audit could not connect — verify SSH is listening on ${SSH_PORT}."
 }
 
+LYNIS_BEFORE=""
+LYNIS_AFTER=""
+
+# lynis_summarize <report-file> — the raw report.dat is very verbose;
+# pull out just the hardening index plus a capped list of warnings and
+# suggestions instead of dumping the whole thing.
+lynis_summarize() {
+    local report="$1"
+    [[ -f "$report" ]] || { warn "Lynis report not found at $report"; return 0; }
+
+    local warn_count sugg_count
+    warn_count=$(grep -c '^warning\[\]=' "$report" 2>/dev/null || echo 0)
+    sugg_count=$(grep -c '^suggestion\[\]=' "$report" 2>/dev/null || echo 0)
+    info "Lynis found ${warn_count} warning(s) and ${sugg_count} suggestion(s)."
+
+    if (( warn_count > 0 )); then
+        echo "  Warnings:"
+        awk -F'|' '{sub(/^warning\[\]=/,"",$1); printf "    - [%s] %s\n", $1, $2}' "$report" | head -n 10
+        (( warn_count > 10 )) && echo "    ... and $((warn_count - 10)) more in the full report."
+    fi
+    if (( sugg_count > 0 )); then
+        echo "  Top suggestions:"
+        awk -F'|' '{sub(/^suggestion\[\]=/,"",$1); printf "    - [%s] %s\n", $1, $2}' "$report" | head -n 10
+        (( sugg_count > 10 )) && echo "    ... and $((sugg_count - 10)) more in the full report."
+    fi
+    info "Full report: ${report}"
+}
+
+run_lynis_baseline() {
+    [[ "$RUN_LYNIS" == "y" ]] || return 0
+    pkg_install lynis || return 0
+    command -v lynis &>/dev/null || { warn "lynis not available — skipping baseline audit."; return 0; }
+
+    if (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would run: lynis audit system --quick (baseline, before hardening)"
+        return 0
+    fi
+    info "Running baseline Lynis audit (before hardening — this takes a couple of minutes)..."
+    lynis audit system --quick --quiet --report-file /var/log/harden-lynis-before.dat &>/var/log/harden-lynis-before.log
+    LYNIS_BEFORE=$(grep -oE '^hardening_index=[0-9]+' /var/log/harden-lynis-before.dat 2>/dev/null | grep -oE '[0-9]+')
+    if [[ -n "$LYNIS_BEFORE" ]]; then
+        info "Baseline Lynis hardening index: ${LYNIS_BEFORE}"
+    else
+        info "Baseline Lynis audit complete."
+    fi
+}
+
 run_lynis_audit() {
     [[ "$RUN_LYNIS" == "y" ]] || return 0
     pkg_install lynis || return 0
     command -v lynis &>/dev/null || { warn "lynis not available — skipping audit."; return 0; }
 
     if (( DRY_RUN )); then
-        echo "${LOG_PREFIX} would run: lynis audit system --quick"
+        echo "${LOG_PREFIX} would run: lynis audit system --quick (final, after hardening)"
         return 0
     fi
-    info "Running Lynis audit (this takes a couple of minutes)..."
-    lynis audit system --quick --quiet &>/tmp/harden-lynis.log
-    local index; index=$(grep -i "hardening index" /tmp/harden-lynis.log | tail -n1)
-    if [[ -n "$index" ]]; then
-        info "Lynis ${index}"
+    info "Running final Lynis audit (this takes a couple of minutes)..."
+    lynis audit system --quick --quiet --report-file /var/log/harden-lynis-after.dat &>/var/log/harden-lynis-after.log
+    LYNIS_AFTER=$(grep -oE '^hardening_index=[0-9]+' /var/log/harden-lynis-after.dat 2>/dev/null | grep -oE '[0-9]+')
+
+    if [[ -n "$LYNIS_BEFORE" && -n "$LYNIS_AFTER" ]]; then
+        local delta=$((LYNIS_AFTER - LYNIS_BEFORE)) sign="+"
+        (( delta < 0 )) && sign=""
+        info "Lynis hardening index: ${LYNIS_BEFORE} -> ${LYNIS_AFTER} (${sign}${delta})"
+    elif [[ -n "$LYNIS_AFTER" ]]; then
+        info "Lynis hardening index: ${LYNIS_AFTER}"
     else
         info "Lynis audit complete."
     fi
-    info "Full report: /var/log/lynis-report.dat (run output: /tmp/harden-lynis.log)"
+    lynis_summarize /var/log/harden-lynis-after.dat
 }
 
 setup_cleanup() {
@@ -1110,7 +1307,7 @@ EOF
     create 0640 root root
 }
 
-/var/log/lynis.log /var/log/lynis-report.dat {
+/var/log/lynis.log /var/log/lynis-report.dat /var/log/harden-lynis-before.log /var/log/harden-lynis-before.dat /var/log/harden-lynis-after.log /var/log/harden-lynis-after.dat {
     monthly
     missingok
     rotate 3
@@ -1129,41 +1326,73 @@ EOF
 # 12. Summary
 # ------------------------------------------------------------------------
 print_summary() {
-    echo
     if (( DRY_RUN )); then
-        info "=== Summary (DRY RUN — nothing was changed) ==="
+        section "Summary (DRY RUN — nothing was changed)"
     else
-        info "=== Summary ==="
+        section "Summary"
     fi
-    echo "  Environment:        ${ENV_TYPE}"
-    echo "  SSH port:           ${SSH_PORT}  (PasswordAuth disabled, PermitRootLogin disabled)"
-    echo "  UFW:                enabled, default deny incoming"
-    echo "  Fail2ban:           enabled on sshd jail"
+
+    sumline() {
+        local label="$1" value="$2" padded
+        padded=$(printf "%-23s" "$label")
+        echo -e "  ${C_BOLD}${padded}${C_RESET} ${value}"
+    }
+    # Colorizes a leading y/n token within a larger string, leaving the
+    # rest of the text (e.g. "y (locked)") untouched.
+    cyn() {
+        local s="$1"
+        if [[ "$s" == y* ]]; then echo -e "${C_GREEN}y${C_RESET}${s:1}"
+        elif [[ "$s" == n* ]]; then echo -e "${C_DIM}n${C_RESET}${s:1}"
+        else echo "$s"; fi
+    }
+
+    sumline "Environment:"        "${ENV_TYPE}"
+    sumline "SSH port:"           "${SSH_PORT} ${C_DIM}(PasswordAuth disabled, PermitRootLogin disabled)${C_RESET}"
+    sumline "UFW:"                "${C_GREEN}enabled${C_RESET}, default deny incoming"
+    sumline "Fail2ban:"           "${C_GREEN}enabled${C_RESET} on sshd jail"
     if [[ "$UU_LEVEL" == "none" ]]; then
-        echo "  Unattended upgrades: disabled"
+        sumline "Unattended upgrades:" "${C_DIM}disabled${C_RESET}"
     else
-        echo "  Unattended upgrades: ${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d, installs at ${UU_INSTALL_TIME}, auto-reboot=${UU_AUTO_REBOOT}, ntfy summary=$( [[ -n "$UU_NTFY_URL" ]] && echo y || echo n )"
+        sumline "Unattended upgrades:" "${UU_LEVEL}, checks every ${UU_CHECK_INTERVAL}d, installs at ${UU_INSTALL_TIME}, auto-reboot=$(cyn "$UU_AUTO_REBOOT"), ntfy summary=$(cyn "$( [[ -n "$UU_NTFY_URL" ]] && echo y || echo n )")"
     fi
-    echo "  Sysctl hardening:   ${SYSCTL_HARDEN} (network) / ${STRICT_SYSCTL} (kernel)"
-    echo "  Ntfy notifications: ${ENABLE_NTFY}"
-    echo "  Root account:       ${LOCK_ROOT} (locked)"
-    echo "  Core dumps:         ${DISABLE_COREDUMPS} (disabled)"
-    echo "  auditd:             ${ENABLE_AUDITD}"
-    echo "  Persistent journal: ${JOURNALD_PERSIST}"
-    echo "  UFW logging:        ${UFW_LOGGING}"
-    echo "  Extra SSH limits:   ${SSH_EXTRA_LIMITS}"
-    echo "  Rootkit scanners:   ${ENABLE_ROOTKIT} (weekly, Sundays 04:00)"
-    echo "  Password policy:    ${PASSWORD_POLICY}"
-    echo "  Cleanup:            tmpreaper + logrotate configured"
+    sumline "Sysctl hardening:"   "network=$(cyn "$SYSCTL_HARDEN") / kernel=$(cyn "$STRICT_SYSCTL")"
+    sumline "Ntfy notifications:" "$(cyn "$ENABLE_NTFY")"
+    sumline "Root account:"      "$(cyn "${LOCK_ROOT} (locked)")"
+    sumline "Core dumps:"        "$(cyn "${DISABLE_COREDUMPS} (disabled)")"
+    sumline "auditd:"            "$(cyn "$ENABLE_AUDITD")"
+    sumline "Persistent journal:" "$(cyn "$JOURNALD_PERSIST")"
+    sumline "UFW logging:"       "$(cyn "$UFW_LOGGING")"
+    if [[ "$SSH_EXTRA_LIMITS" == "y" ]]; then
+        sumline "Extra SSH limits:" "$(cyn "y")  MaxAuthTries=${SSH_MAX_AUTH_TRIES}, LoginGraceTime=${SSH_LOGIN_GRACE_TIME}s, ClientAliveInterval=${SSH_CLIENT_ALIVE_INTERVAL}s, ClientAliveCountMax=${SSH_CLIENT_ALIVE_COUNT_MAX}"
+    else
+        sumline "Extra SSH limits:" "$(cyn "n")"
+    fi
+    sumline "Rootkit scanners:"  "$(cyn "${ENABLE_ROOTKIT} (weekly, Sundays 04:00)")"
+    sumline "Shell idle timeout:" "$(cyn "${SHELL_TIMEOUT}")$( [[ "$SHELL_TIMEOUT" == y ]] && echo " (${SHELL_TIMEOUT_SECS}s)" )"
+    sumline "Time sync:"          "$(cyn "$ENABLE_TIMESYNC")"
+    sumline "Blacklisted protocols:" "$(cyn "$BLACKLIST_PROTOCOLS")"
+    sumline "Process accounting:" "$(cyn "$ENABLE_ACCOUNTING")"
+    sumline "Password policy:"   "$(cyn "$PASSWORD_POLICY")"
+    sumline "Cleanup:"           "${C_GREEN}configured${C_RESET} (tmpreaper + logrotate)"
+    if [[ -n "$LYNIS_BEFORE" || -n "$LYNIS_AFTER" ]]; then
+        if [[ -n "$LYNIS_BEFORE" && -n "$LYNIS_AFTER" ]]; then
+            local delta=$((LYNIS_AFTER - LYNIS_BEFORE)) sign="+"
+            (( delta < 0 )) && sign=""
+            sumline "Lynis index:" "${LYNIS_BEFORE} -> ${LYNIS_AFTER} (${sign}${delta})"
+        else
+            sumline "Lynis index:" "${LYNIS_AFTER:-$LYNIS_BEFORE}"
+        fi
+    fi
     echo
+
     warn "Do NOT close this SSH session until you've confirmed a NEW connection works on port ${SSH_PORT}."
     [[ "$REGEN_HOSTKEYS" == "y" ]] && warn "Host keys were regenerated — clients must clear old known_hosts entries."
-    echo "Backups of any files this script modified in place were saved as <file>.harden-bak."
+    echo -e "${C_DIM}Backups of any files this script modified in place were saved as <file>.harden-bak.${C_RESET}"
     echo
-    echo "Reminder: UFW only allows SSH right now. Add a rule for any other"
+    echo -e "${C_BOLD}Reminder:${C_RESET} UFW only allows SSH right now. Add a rule for any other"
     echo "service this host needs to expose, e.g.:"
-    echo "  sudo ufw allow https        # or: sudo ufw allow 443/tcp"
-    echo "  sudo ufw allow http         # or: sudo ufw allow 80/tcp"
+    echo -e "  ${C_CYAN}sudo ufw allow https${C_RESET}        # or: sudo ufw allow 443/tcp"
+    echo -e "  ${C_CYAN}sudo ufw allow http${C_RESET}         # or: sudo ufw allow 80/tcp"
     echo "Check current rules with: sudo ufw status verbose"
 }
 
@@ -1186,25 +1415,53 @@ main() {
 
     preflight
     gather_config
+
+    if [[ "$RUN_LYNIS" == "y" ]]; then
+        section "Baseline Audit"
+        run_lynis_baseline
+    fi
+
+    section "Account & Access"
     setup_user
     audit_sudo_access
     setup_root_lock
+    setup_shell_timeout
+
+    section "System"
     setup_timezone
+    setup_timesync
     setup_unattended_upgrades
+
+    section "SSH"
     setup_ssh
+
+    section "Firewall"
     setup_ufw
+
+    section "Intrusion Prevention"
     setup_fail2ban
+
+    section "Kernel & Resource Limits"
     setup_sysctl
     setup_coredumps_limits
+    setup_blacklist_protocols
+
+    section "Auditing & Compliance"
     setup_auditd
     setup_apparmor_check
     setup_password_policy
     setup_journald_persistent
     setup_rootkit_scanners
+    setup_accounting
+
+    section "Cleanup"
     setup_cleanup
+
+    section "Verification"
     run_debsums_check
     run_ssh_audit
     run_lynis_audit
+
     print_summary
 }
 

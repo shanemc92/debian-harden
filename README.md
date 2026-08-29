@@ -2,11 +2,22 @@
 
 Interactive hardening and auto-cleanup setup for Debian-based systems
 (Debian, Ubuntu, Raspberry Pi OS). Asks a handful of questions up front,
-then applies everything unattended.
+then applies everything unattended. Output is colour-coded and organized
+into sections when run in a terminal that supports it (plain text
+otherwise — see [Design notes](#design-notes)).
 
-![config-screenshot](docs/config-screenshot.png)
+## Screenshots
 
-![result-screenshot](docs/result-screenshot.png)
+**Configuration prompts:**
+
+![Configuration prompts](docs/screenshot-config.png)
+
+**Summary output:**
+
+![Summary output](docs/screenshot-summary.png)
+
+*(Replace the paths above with your own screenshots — e.g. drop them in
+a `docs/` folder in the repo, or point at any image URL.)*
 
 ## What it does
 
@@ -42,11 +53,19 @@ then applies everything unattended.
 - Makes systemd journal logs persistent across reboots, capped at 500M / 1 month
 - Enables UFW logging
 - Adds extra SSH limits (`MaxAuthTries`, `LoginGraceTime`, `ClientAliveInterval`, no X11 forwarding)
+- Sets explicit SSH safe-defaults (`PermitEmptyPasswords no`, `IgnoreRhosts yes`) unconditionally
+- Extends the SSH banner to `/etc/issue` and `/etc/motd`, not just the SSH pre-login prompt
+- Auto-logs-out idle interactive shells (`TMOUT`) — optional
+- Explicitly enables `systemd-timesyncd` for NTP, skipped if chrony/ntpd is already active — optional
+- Blacklists rarely-used network protocols (dccp, sctp, rds, tipc) from auto-loading — optional
+- Enables process accounting and `sysstat` — optional
 - Installs `rkhunter` + `chkrootkit` with a weekly scan (Sundays 04:00) that
   only alerts via ntfy when it finds something — reuses the SSH-login/fail2ban topic
 - Verifies installed package files against their checksums with `debsums`
 - Runs `ssh-audit` against localhost afterwards to confirm the cipher config took
-- Runs a Lynis audit at the end and reports the hardening index
+- Offers to run Lynis both before and after hardening to compare the
+  hardening index, and summarizes the (very verbose) raw report into a
+  capped list of warnings/suggestions instead of dumping it in full
 - Sets up `tmpreaper` and `logrotate` for automatic cleanup, including the
   UFW, rootkit-scan, unattended-upgrades and Lynis logs so they can't fill the disk
 
@@ -123,11 +142,15 @@ sudo bash harden-undo.sh
 ```
 
 It restores from the `.harden-bak` backups where they exist, and removes
-files/config `harden.sh` created otherwise. Not everything is offered —
-things with no meaningful "undo" (timezone, the AppArmor status check,
-which makes no changes) aren't included, and creating a user account
-isn't reversible through this script (deleting an account risks deleting
-its home directory) — remove one manually with `userdel` if needed.
+files/config `harden.sh` created otherwise. Prompts for the handful of
+reverts that meaningfully weaken security — disabling UFW or fail2ban,
+re-enabling SSH password/root login, unlocking the root account, or
+restoring passwordless sudo — are shown in red to distinguish them from
+routine cleanup. Not everything is offered — things with no meaningful
+"undo" (timezone, the AppArmor status check, which makes no changes)
+aren't included, and creating a user account isn't reversible through
+this script (deleting an account risks deleting its home directory) —
+remove one manually with `userdel` if needed.
 
 ## Design notes
 
@@ -151,6 +174,18 @@ its home directory) — remove one manually with `userdel` if needed.
   doesn't leave stale config or open ports behind. Host key backups are
   only seeded once, so re-running with host key regeneration enabled
   won't overwrite the true original keys with an already-regenerated set.
+- Colour and the section dividers auto-disable when output isn't a
+  terminal, `NO_COLOR` is set, or `tput` isn't available — falling back
+  to plain, uncoloured text rather than raw escape codes. The dividers
+  and markers use plain ASCII (`=`, `[OK]`) rather than Unicode
+  box-drawing or symbol characters, since those can render as garbled
+  text on terminals/locales that don't handle multi-byte UTF-8 cleanly.
+- The Configuration phase groups its prompts under lightweight `-----`
+  subheadings (Account & Access, System, SSH, Firewall, Intrusion
+  Prevention, Kernel & Resource Limits, Auditing & Compliance, Cleanup,
+  Verification) that match the full-width section dividers those answers
+  get applied under later in the run — so it's clear upfront which
+  question feeds into which part of the actual hardening.
 
 ## Warnings
 

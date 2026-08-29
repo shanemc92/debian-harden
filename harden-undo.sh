@@ -11,18 +11,56 @@
 set -uo pipefail
 
 # ------------------------------------------------------------------------
+# Colour (matches harden.sh — auto-disabled when not on a terminal)
+# ------------------------------------------------------------------------
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && command -v tput &>/dev/null && [[ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]]; then
+    C_RESET=$(tput sgr0);   C_BOLD=$(tput bold);    C_DIM=$(tput dim)
+    C_RED=$(tput setaf 1);  C_GREEN=$(tput setaf 2); C_YELLOW=$(tput setaf 3)
+    C_BLUE=$(tput setaf 4); C_CYAN=$(tput setaf 6)
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+# ------------------------------------------------------------------------
 # Helpers (same conventions as harden.sh)
 # ------------------------------------------------------------------------
-LOG_PREFIX="[undo]"
-info()  { echo "${LOG_PREFIX} $*"; }
-warn()  { echo "${LOG_PREFIX} WARNING: $*" >&2; }
-err()   { echo "${LOG_PREFIX} ERROR: $*" >&2; }
+LOG_PREFIX="${C_CYAN}${C_BOLD}[undo]${C_RESET}"
+info()  { echo -e "${LOG_PREFIX} $*"; }
+warn()  { echo -e "${LOG_PREFIX} ${C_YELLOW}${C_BOLD}WARNING:${C_RESET} $*" >&2; }
+err()   { echo -e "${LOG_PREFIX} ${C_RED}${C_BOLD}ERROR:${C_RESET} $*" >&2; }
+ok()    { echo -e "${LOG_PREFIX} ${C_GREEN}[OK]${C_RESET} $*"; }
+
+section() {
+    local title=" $* " width cols rule
+    cols=$(tput cols 2>/dev/null || echo 60)
+    [[ "$cols" =~ ^[0-9]+$ ]] || cols=60
+    width=$(( cols < 40 ? 40 : (cols > 60 ? 60 : cols) ))
+    rule=$(printf '%*s' "$width" '' | tr ' ' '=')
+    echo
+    echo -e "${C_BLUE}${C_BOLD}${rule}${C_RESET}"
+    echo -e "${C_BLUE}${C_BOLD}${title}${C_RESET}"
+    echo -e "${C_BLUE}${C_BOLD}${rule}${C_RESET}"
+}
 
 confirm() {
-    local prompt="$1" default="${2:-n}" reply
+    local prompt="$1" default="${2:-n}" reply=""
     local hint="y/N"
     [[ "$default" == "y" ]] && hint="Y/n"
-    read -rp "${prompt} [${hint}]: " reply < /dev/tty
+    read -rp "${C_BOLD}${prompt}${C_RESET} ${C_DIM}[${hint}]${C_RESET}: " reply < /dev/tty
+    reply="${reply:-$default}"
+    [[ "$reply" =~ ^[Yy] ]]
+}
+
+# confirm_danger — same as confirm(), but rendered in red to flag reverts
+# that meaningfully weaken security (disabling the firewall/fail2ban,
+# re-enabling password SSH auth, unlocking accounts, restoring
+# passwordless sudo) rather than just removing a convenience feature.
+confirm_danger() {
+    local prompt="$1" default="${2:-n}" reply=""
+    local hint="y/N"
+    [[ "$default" == "y" ]] && hint="Y/n"
+    read -rp "${C_RED}${C_BOLD}${prompt}${C_RESET} ${C_DIM}[${hint}]${C_RESET}: " reply < /dev/tty
     reply="${reply:-$default}"
     [[ "$reply" =~ ^[Yy] ]]
 }
@@ -39,7 +77,7 @@ restore_backup() {
     local file="$1"
     if [[ -f "${file}.harden-bak" ]]; then
         cp -a "${file}.harden-bak" "$file"
-        info "Restored ${file} from ${file}.harden-bak."
+        ok "Restored ${file} from ${file}.harden-bak."
         return 0
     fi
     return 1
@@ -70,12 +108,12 @@ revert_ssh() {
     [[ -f "$dropin" ]] || { info "SSH hardening drop-in not found — skipping."; return 0; }
 
     echo
-    if confirm "Revert SSH hardening? This restores port 22, re-enables password authentication and root login, and removes the banner/cipher restrictions. Only do this if SSH access is currently broken." "n"; then
+    if confirm_danger "Revert SSH hardening? This restores port 22, re-enables password authentication and root login, and removes the banner/cipher restrictions. Only do this if SSH access is currently broken." "n"; then
         rm -f "$dropin"
         restore_backup /etc/ssh/sshd_config || true
         if sshd -t 2>/tmp/harden-undo-sshd.log; then
             if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
-                info "SSH hardening reverted and service restarted on the default port (22)."
+                ok "SSH hardening reverted and service restarted on the default port (22)."
                 warn "If UFW only allows your custom SSH port, add a rule for port 22 too (or whatever port you're now using) before you disconnect."
             else
                 err "Reverted config but SSH service restart failed — check 'systemctl status ssh'."
@@ -117,9 +155,9 @@ revert_ufw() {
     ufw status 2>/dev/null | grep -q "Status: active" || { info "UFW is not active — skipping."; return 0; }
 
     echo
-    if confirm "Disable UFW entirely? This removes ALL firewall protection, not just what harden.sh added." "n"; then
+    if confirm_danger "Disable UFW entirely? This removes ALL firewall protection, not just what harden.sh added." "n"; then
         ufw --force disable
-        info "UFW disabled."
+        ok "UFW disabled."
         note_change
     fi
 }
@@ -131,13 +169,13 @@ revert_fail2ban() {
     [[ -f /etc/fail2ban/jail.local ]] || { info "No fail2ban jail.local found — skipping."; return 0; }
 
     echo
-    if confirm "Disable fail2ban and remove its custom config (jail.local, ntfy action, alert cron job)?" "n"; then
+    if confirm_danger "Disable fail2ban and remove its custom config (jail.local, ntfy action, alert cron job)?" "n"; then
         systemctl disable --now fail2ban &>/dev/null
         rm -f /etc/fail2ban/jail.local /etc/fail2ban/action.d/ntfy.local
         restore_backup /etc/fail2ban/fail2ban.conf || rm -f /etc/fail2ban/fail2ban.local
         rm -f /usr/bin/scripts/f2b-ntfy.sh
         crontab -l 2>/dev/null | grep -v 'f2b-ntfy.sh' | crontab - 2>/dev/null || true
-        info "fail2ban disabled and custom config removed."
+        ok "fail2ban disabled and custom config removed."
         note_change
     fi
 }
@@ -157,7 +195,7 @@ revert_unattended_upgrades() {
         systemctl restart apt-daily-upgrade.timer 2>/dev/null || true
         rm -f /usr/bin/scripts/uu-ntfy-summary.sh
         crontab -l 2>/dev/null | grep -v 'uu-ntfy-summary.sh' | crontab - 2>/dev/null || true
-        info "Unattended upgrades disabled and custom config/timer/cron removed."
+        ok "Unattended upgrades disabled and custom config/timer/cron removed."
         note_change
     fi
 }
@@ -170,8 +208,54 @@ revert_root_lock() {
     passwd -S root 2>/dev/null | awk '{print $2}' | grep -q '^L' || return 0
 
     echo
-    if confirm "Unlock the root account password?" "n"; then
-        passwd -u root && info "Root account unlocked." || warn "Could not unlock root account."
+    if confirm_danger "Unlock the root account password?" "n"; then
+        passwd -u root && ok "Root account unlocked." || warn "Could not unlock root account."
+        note_change
+    fi
+}
+
+revert_shell_timeout() {
+    [[ -f /etc/profile.d/99-harden-tmout.sh ]] || return 0
+
+    echo
+    if confirm "Remove the idle shell auto-logout timeout?" "n"; then
+        rm -f /etc/profile.d/99-harden-tmout.sh
+        ok "Idle shell timeout removed."
+        note_change
+    fi
+}
+
+revert_timesync() {
+    [[ -f /etc/systemd/system/multi-user.target.wants/systemd-timesyncd.service ]] \
+        || systemctl is-enabled systemd-timesyncd &>/dev/null || return 0
+
+    echo
+    if confirm "Disable systemd-timesyncd (only do this if you're switching to a different time-sync tool)?" "n"; then
+        systemctl disable --now systemd-timesyncd &>/dev/null
+        ok "systemd-timesyncd disabled."
+        note_change
+    fi
+}
+
+revert_blacklist_protocols() {
+    [[ -f /etc/modprobe.d/harden-blacklist-protocols.conf ]] || return 0
+
+    echo
+    if confirm "Remove the rarely-used network protocol blacklist (dccp/sctp/rds/tipc)?" "n"; then
+        rm -f /etc/modprobe.d/harden-blacklist-protocols.conf
+        ok "Protocol blacklist removed."
+        note_change
+    fi
+}
+
+revert_accounting() {
+    systemctl is-enabled sysstat &>/dev/null || command -v accton &>/dev/null || return 0
+
+    echo
+    if confirm "Disable process accounting and sysstat?" "n"; then
+        systemctl disable --now sysstat &>/dev/null
+        systemctl disable --now acct &>/dev/null 2>/dev/null || service acct stop 2>/dev/null || true
+        ok "Process accounting and sysstat disabled."
         note_change
     fi
 }
@@ -205,7 +289,7 @@ revert_sysctl_network() {
             "net.ipv4.conf.all.accept_source_route" "net.ipv6.conf.all.accept_source_route" \
             "net.ipv4.conf.default.accept_source_route" "net.ipv6.conf.default.accept_source_route" \
             "net.ipv4.conf.all.rp_filter" "net.ipv4.conf.default.rp_filter"
-        info "Network sysctl hardening reverted."
+        ok "Network sysctl hardening reverted."
         note_change
     fi
 }
@@ -216,7 +300,7 @@ revert_sysctl_strict() {
     echo
     if confirm "Revert strict kernel sysctls (ASLR/kptr/dmesg restrict, TCP syncookies)?" "n"; then
         remove_sysctl_keys "kernel.randomize_va_space" "kernel.kptr_restrict" "kernel.dmesg_restrict" "net.ipv4.tcp_syncookies"
-        info "Strict kernel sysctls reverted."
+        ok "Strict kernel sysctls reverted."
         note_change
     fi
 }
@@ -232,7 +316,7 @@ revert_auditd() {
         rm -f /etc/audit/rules.d/harden.rules
         command -v augenrules &>/dev/null && augenrules --load &>/dev/null
         systemctl disable --now auditd &>/dev/null
-        info "auditd disabled and watch rules removed."
+        ok "auditd disabled and watch rules removed."
         note_change
     fi
 }
@@ -253,7 +337,7 @@ revert_password_policy() {
             sed -i -E 's/^(PASS_MIN_DAYS\s+).*/\10/' /etc/login.defs
             sed -i -E 's/^(PASS_WARN_AGE\s+).*/\17/' /etc/login.defs
         fi
-        info "Password policy reverted."
+        ok "Password policy reverted."
         note_change
     fi
 }
@@ -268,7 +352,7 @@ revert_journald_persistent() {
     if confirm "Revert persistent journald logging (back to volatile//default)?" "n"; then
         rm -f /etc/systemd/journald.conf.d/99-harden.conf
         systemctl restart systemd-journald 2>/dev/null || warn "Could not restart systemd-journald."
-        info "Journald persistence reverted."
+        ok "Journald persistence reverted."
         note_change
     fi
 }
@@ -280,7 +364,7 @@ revert_ufw_logging() {
     echo
     if confirm "Turn off UFW logging?" "n"; then
         ufw logging off
-        info "UFW logging disabled."
+        ok "UFW logging disabled."
         note_change
     fi
 }
@@ -292,7 +376,7 @@ revert_rootkit_scanners() {
     if confirm "Remove the weekly rkhunter/chkrootkit scan (keeps the packages installed)?" "n"; then
         rm -f /usr/bin/scripts/rootkit-scan.sh
         crontab -l 2>/dev/null | grep -v 'rootkit-scan.sh' | crontab - 2>/dev/null || true
-        info "Weekly rootkit scan removed."
+        ok "Weekly rootkit scan removed."
         note_change
     fi
 }
@@ -305,9 +389,9 @@ revert_sudoers_nopasswd() {
     for bak in $files; do
         f="${bak%.harden-bak}"
         echo
-        if confirm "Restore passwordless sudo from ${f} (undo the password requirement harden.sh added)? This lowers security." "n"; then
+        if confirm_danger "Restore passwordless sudo from ${f} (undo the password requirement harden.sh added)? This lowers security." "n"; then
             restore_backup "$f"
-            info "Restored NOPASSWD sudo access from ${f}."
+            ok "Restored NOPASSWD sudo access from ${f}."
             note_change
         fi
     done
@@ -324,7 +408,7 @@ revert_ntfy_hook() {
         sed -i '/ntfy-ssh-login\.sh/d' /etc/pam.d/sshd
         sed -i '/^# Ntfy notification on login/d' /etc/pam.d/sshd
         rm -f /usr/bin/ntfy-ssh-login.sh
-        info "ntfy SSH-login hook removed."
+        ok "ntfy SSH-login hook removed."
         note_change
     fi
 }
@@ -338,7 +422,7 @@ revert_cleanup() {
     echo
     if confirm "Remove the tmpreaper/logrotate cleanup config added by harden.sh?" "n"; then
         rm -f /etc/tmpreaper.conf /etc/logrotate.d/harden-varlog
-        info "Cleanup config removed."
+        ok "Cleanup config removed."
         note_change
     fi
 }
@@ -357,6 +441,7 @@ main() {
         fi
     fi
 
+    section "Reviewing applied hardening"
     info "Checking what's present and asking about each — 'n' or Enter leaves it as-is."
 
     revert_ssh
@@ -365,10 +450,14 @@ main() {
     revert_fail2ban
     revert_unattended_upgrades
     revert_root_lock
+    revert_shell_timeout
+    revert_timesync
     revert_coredumps
+    revert_blacklist_protocols
     revert_sysctl_network
     revert_sysctl_strict
     revert_auditd
+    revert_accounting
     revert_password_policy
     revert_journald_persistent
     revert_ufw_logging
@@ -377,11 +466,11 @@ main() {
     revert_ntfy_hook
     revert_cleanup
 
-    echo
+    section "Summary"
     if [[ $CHANGED -eq 0 ]]; then
         info "Nothing was changed."
     else
-        info "Done — ${CHANGED} change(s) reverted."
+        ok "Done — ${CHANGED} change(s) reverted."
         warn "If you reverted SSH hardening, test a new connection before closing this session."
     fi
 }
