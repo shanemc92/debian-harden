@@ -4,7 +4,7 @@ Interactive hardening and auto-cleanup setup for Debian-based systems
 (Debian, Ubuntu, Raspberry Pi OS). Asks a handful of questions up front,
 then applies everything unattended.
 
-![config-screenshot](C:/Users/shane/Downloads/docs/config-screenshot.png)
+![config-screenshot](docs/config-screenshot.png)
 
 ![result-screenshot](docs/result-screenshot.png)
 
@@ -76,7 +76,7 @@ new connection on the new port before closing your current session.**
 ### Run directly from GitHub or a self-hosted server
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/harden.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/shanemc92/debian-harden/main/harden.sh)"
 # or
 sudo bash -c "$(wget -qO- https://your-server.example.com/harden.sh)"
 ```
