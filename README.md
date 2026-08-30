@@ -57,7 +57,8 @@ otherwise — see [Design notes](#design-notes)).
 - Blacklists rarely-used network protocols (dccp, sctp, rds, tipc) from auto-loading — optional
 - Enables process accounting and `sysstat` — optional
 - Installs `rkhunter` + `chkrootkit` with a weekly scan (Sundays 04:00) that
-  only alerts via ntfy when it finds something — reuses the SSH-login/fail2ban topic
+  only alerts via ntfy when it finds something — reuses the SSH-login/fail2ban
+  topic. Tuned against known false positives (see Design notes below).
 - Verifies installed package files against their checksums with `debsums`
 - Runs `ssh-audit` against localhost afterwards to confirm the cipher config took
 - Offers to run Lynis both before and after hardening to compare the
@@ -85,6 +86,41 @@ sudo bash harden.sh --dry-run
 
 Dry-run asks all the same questions and reports every file write, package
 install and command it would run, then exits without making changes.
+
+### Running non-interactively with a config file
+
+For a repeatable/standardized setup — or automation (Ansible, Terraform
+provisioners, CI) — every question can be answered up front in a config
+file instead of interactively:
+
+```bash
+sudo bash harden.sh --print-config > harden.conf   # generate a fully-commented template
+# edit harden.conf — fill in your ntfy topics, SSH port, etc.
+sudo bash harden.sh --config harden.conf           # runs with zero prompts
+```
+
+`harden.conf.example` in this repo is exactly that template, ready to copy
+and edit. Anything left out of the file falls back to the same default
+shown in the template, so you only need to include what you want to
+change. Combine with `--dry-run` to preview a config file's effect before
+running it for real.
+
+Two settings exist only for non-interactive use (there's no sensible way
+to prompt for them, since they need to key off usernames the box may
+already have):
+
+- `NEW_USER_PASSWORD` — sets a password for `NEW_USER` on creation.
+  Accepts plaintext or a crypt hash (starting with `$`, e.g. from
+  `mkpasswd -m sha-512`) — a hash keeps a real secret out of the config
+  file. If left blank, the new account is created with no password at
+  all, which will silently break sudo for it (the account can't
+  authenticate to sudo) — the script warns loudly if this happens, but
+  it won't stop the run.
+- `SUDO_USER_PASSWORDS` — fixes existing accounts that already have sudo
+  access but no working password (e.g. a cloud image's default
+  passwordless-sudo user). One `username:secret` per line, same
+  plaintext-or-hash rule as above. Any flagged account with no matching
+  entry here is left alone and just warned about — never silently broken.
 
 Answer the prompts as they appear. At the end it restarts SSH — **test a
 new connection on the new port before closing your current session.**
@@ -150,6 +186,36 @@ this script (deleting an account risks deleting its home directory) —
 remove one manually with `userdel` if needed.
 
 ## Design notes
+
+- The rootkit scan filters three known, well-documented false positives
+  rather than leaving them to fire alerts every run:
+  - `WEB_CMD` and two known-benign hidden files (`/etc/.updated`,
+    `/etc/.resolv.conf.systemd-resolved.bak`) are suppressed directly in
+    `rkhunter.conf`.
+  - rkhunter has a long-standing, still-open bug where it only greps the
+    literal `sshd_config` file and doesn't resolve `Include`d drop-ins —
+    it always reports `PermitRootLogin` as unset even when this script's
+    drop-in sets it (independently confirmed by the ssh-audit check). The
+    weekly scan filters that specific line before deciding whether to
+    alert, but leaves it visible in the log.
+  - chkrootkit's own convention is lowercase `"not infected"` for a clean
+    result and uppercase `INFECTED` for an actual finding — the original
+    check here used a case-insensitive match, which matched every single
+    clean result too and would have alerted on nearly every run
+    regardless of whether anything was actually wrong. Fixed to match
+    case-sensitively.
+- Beyond those specific fixes, the weekly scan self-baselines: its first
+  run (triggered immediately at setup time, not left until the first
+  weekly cron trigger) records whatever rkhunter/chkrootkit report as
+  normal for that specific server — e.g. a mail package the OS itself
+  installs creating a `postfix` user isn't a threat on day one, but an
+  unexplained new account weeks later is. Every run after that only
+  alerts on lines that weren't in the baseline. Rather than hand-maintain
+  a global whitelist of every package that might ever trigger this
+  class of warning, each server learns its own. To accept a new finding
+  as normal going forward (e.g. after intentionally installing a new
+  service), delete the relevant file under `/var/lib/harden-rootkit-scan/`
+  and the next run re-baselines it.
 
 - SSH changes go in a drop-in file, not edited into `sshd_config` directly.
   `sshd -t` validates the config before any restart; if validation fails,

@@ -375,7 +375,9 @@ revert_rootkit_scanners() {
     echo
     if confirm "Remove the weekly rkhunter/chkrootkit scan (keeps the packages installed)?" "n"; then
         rm -f /usr/bin/scripts/rootkit-scan.sh
+        rm -rf /var/lib/harden-rootkit-scan
         crontab -l 2>/dev/null | grep -v 'rootkit-scan.sh' | crontab - 2>/dev/null || true
+        restore_backup /etc/rkhunter.conf
         ok "Weekly rootkit scan removed."
         note_change
     fi

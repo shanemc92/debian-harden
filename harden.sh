@@ -36,33 +36,194 @@ fi
 LOG_TAG="${C_CYAN}${C_BOLD}[harden]${C_RESET}"
 LOG_PREFIX="$LOG_TAG"
 DRY_RUN=0
+NONINTERACTIVE=0
+CONFIG_FILE=""
 
-for arg in "$@"; do
+print_config_template() {
+    cat <<'TEMPLATE'
+# harden.sh config file — sourced as shell, so it's KEY=VALUE, one per
+# line, quoting anything with spaces. Booleans accept y/n (yes/true/1
+# also work). Run with: sudo bash harden.sh --config harden.conf
+#
+# Anything left unset falls back to the same default shown here, so you
+# only need to include the values you want to change from default.
+
+## Account & Access
+NEW_USER=""                    # new sudo user to create, blank to skip
+EXISTING_USER=""                # used instead of NEW_USER if that's blank and SSH_PUBKEY is set
+SSH_PUBKEY=""                   # public key to install for NEW_USER/EXISTING_USER, blank to skip
+NEW_USER_PASSWORD=""            # plaintext, or a crypt hash (starting with $) from mkpasswd -m sha-512
+LOCK_ROOT="y"
+SHELL_TIMEOUT="y"
+SHELL_TIMEOUT_SECS="900"
+
+## System
+TIMEZONE="UTC"
+ENABLE_TIMESYNC="y"
+UU_CHECK_INTERVAL="1"
+UU_LEVEL="security"             # security | all | none
+UU_INSTALL_TIME="03:00"
+UU_AUTO_REBOOT="n"
+UU_REBOOT_TIME="03:30"
+UU_NTFY_URL=""                  # separate ntfy topic for the update summary
+
+## SSH
+SSH_PORT="22"
+ENV_TYPE="internal"             # internal | external
+SSHAUDIT_HARDEN="y"
+REGEN_HOSTKEYS="n"              # only asked/applied when ENV_TYPE=external
+SSH_BANNER="y"
+BANNER_TEXT="Authorized access only. All activity may be monitored and reported."
+SSH_EXTRA_LIMITS="y"
+SSH_MAX_AUTH_TRIES="3"
+SSH_LOGIN_GRACE_TIME="30"
+SSH_CLIENT_ALIVE_INTERVAL="300"
+SSH_CLIENT_ALIVE_COUNT_MAX="2"
+
+## Firewall
+LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal
+UFW_LOGGING="y"
+
+## Intrusion Prevention
+ENABLE_NTFY="n"
+NTFY_URL=""                     # ntfy topic for SSH-login + fail2ban-ban alerts
+F2B_IGNOREIP=""                 # only used when ENV_TYPE=internal
+
+## Kernel & Resource Limits
+SYSCTL_HARDEN="y"
+STRICT_SYSCTL="y"
+DISABLE_COREDUMPS="y"
+BLACKLIST_PROTOCOLS="y"
+
+## Auditing & Compliance
+ENABLE_AUDITD="y"
+CHECK_APPARMOR="y"
+PASSWORD_POLICY="y"
+PW_MINLEN="12"
+JOURNALD_PERSIST="y"
+ENABLE_ROOTKIT="y"
+ENABLE_ACCOUNTING="y"
+
+# Applied automatically, no separate toggle: any NOPASSWD sudoers entry
+# found on the box gets fixed the same way every time.
+FIX_NOPASSWD_SUDOERS="y"
+
+# Fixes locked/passwordless accounts that already have sudo access
+# (e.g. a cloud image's default user). One "username:secret" per line —
+# secret can be plaintext or a crypt hash (starting with $). Any flagged
+# account with no matching entry here is left alone and just warned
+# about, never silently broken.
+SUDO_USER_PASSWORDS=""
+
+## Cleanup
+TMPREAPER_TIME="7d"
+TMPREAPER_EXTRA=""
+LOGROTATE_WEEKS="4"
+
+## Verification
+RUN_DEBSUMS="y"
+RUN_SSHAUDIT="y"
+RUN_LYNIS="y"
+TEMPLATE
+}
+
+usage() {
+    cat <<'USAGE'
+harden.sh - interactive Debian/Ubuntu hardening and auto-cleanup setup.
+
+Usage: sudo bash harden.sh [options]
+
+  --dry-run, -n        Report exactly what would change without modifying
+                        anything or installing packages.
+  --config, -c <file>  Read all answers from <file> instead of prompting —
+                        runs completely non-interactively. See
+                        --print-config for every available setting.
+  --print-config        Print a fully-commented template config file to
+                        stdout and exit (redirect it to a file to start
+                        from it: sudo bash harden.sh --print-config > harden.conf).
+  --help, -h            Show this message.
+USAGE
+}
+
+args=("$@")
+i=0
+while (( i < ${#args[@]} )); do
+    arg="${args[$i]}"
     case "$arg" in
         --dry-run|-n)
             DRY_RUN=1
             LOG_TAG="${C_MAGENTA}${C_BOLD}[harden][dry-run]${C_RESET}"
             LOG_PREFIX="$LOG_TAG"
             ;;
-        --help|-h)
-            cat <<'USAGE'
-harden.sh - interactive Debian/Ubuntu hardening and auto-cleanup setup.
-
-Usage: sudo bash harden.sh [--dry-run]
-
-  --dry-run, -n   Ask all the same questions and report exactly what would
-                  change, without modifying anything or installing packages.
-  --help, -h      Show this message.
-USAGE
+        --config|-c)
+            i=$((i+1))
+            CONFIG_FILE="${args[$i]:-}"
+            NONINTERACTIVE=1
+            ;;
+        --config=*)
+            CONFIG_FILE="${arg#--config=}"
+            NONINTERACTIVE=1
+            ;;
+        --print-config)
+            print_config_template
             exit 0
             ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg" >&2
+            usage
+            exit 1
+            ;;
     esac
+    i=$((i+1))
 done
 
 info()  { echo -e "${LOG_PREFIX} $*"; }
 warn()  { echo -e "${LOG_PREFIX} ${C_YELLOW}${C_BOLD}WARNING:${C_RESET} $*" >&2; }
 err()   { echo -e "${LOG_PREFIX} ${C_RED}${C_BOLD}ERROR:${C_RESET} $*" >&2; }
 ok()    { echo -e "${LOG_PREFIX} ${C_GREEN}[OK]${C_RESET} $*"; }
+
+# normalize_bool <value> <default> — accepts y/yes/true/1 (case-insensitive)
+# as "y", everything else (including unset/empty) as "n". Used so config
+# file values and interactive answers both end up in the same y/n form.
+normalize_bool() {
+    local v="${1:-$2}"
+    case "${v,,}" in
+        y|yes|true|1) echo "y" ;;
+        *) echo "n" ;;
+    esac
+}
+
+# set_user_password <user> <secret> — secret can be plaintext or a crypt
+# hash (auto-detected by a leading $, e.g. from `mkpasswd -m sha-512`).
+set_user_password() {
+    local user="$1" secret="$2"
+    [[ -z "$secret" ]] && return 1
+    if [[ "$secret" == \$* ]]; then
+        echo "${user}:${secret}" | chpasswd -e
+    else
+        echo "${user}:${secret}" | chpasswd
+    fi
+}
+
+# lookup_sudo_password <user> — searches SUDO_USER_PASSWORDS (one
+# "user:secret" per line) for a matching entry.
+lookup_sudo_password() {
+    local target="$1" line lu lp
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        lu="${line%%:*}"
+        lp="${line#*:}"
+        if [[ "$lu" == "$target" ]]; then
+            echo "$lp"
+            return 0
+        fi
+    done <<< "${SUDO_USER_PASSWORDS:-}"
+    return 1
+}
 
 # section <title> — visual divider between the major phases of a run.
 section() {
@@ -168,6 +329,7 @@ if (( DRY_RUN )); then
     ssh-keygen() { _report "ssh-keygen $*"; }
     augenrules() { _report "augenrules $*"; }
     sysctl()     { if [[ "${1:-}" == "--system" ]]; then _report "sysctl $*"; else command sysctl "$@"; fi; }
+    chpasswd()   { _report "chpasswd $*"; cat > /dev/null; }
 fi
 
 ask() {
@@ -279,178 +441,245 @@ preflight() {
 # 2. Gather configuration
 # ------------------------------------------------------------------------
 gather_config() {
-    section "Configuration"
-
-    subsection "Account & Access"
-    NEW_USER=$(ask "New sudo user to create (blank to skip)" "")
-
-    SSH_PUBKEY=""
-    if [[ -n "$NEW_USER" ]] || confirm "Add an SSH public key to an existing user's authorized_keys?" "y"; then
-        [[ -z "$NEW_USER" ]] && EXISTING_USER=$(ask "Which existing username?" "${SUDO_USER:-}")
-        SSH_PUBKEY=$(ask "Paste the SSH public key (blank to skip)" "")
+    if (( NONINTERACTIVE )); then
+        info "Non-interactive mode — using values from ${CONFIG_FILE}."
+    else
+        section "Configuration"
     fi
 
-    LOCK_ROOT="n"
-    confirm "Lock the root account password (on top of disabling root SSH login)?" "y" && LOCK_ROOT="y"
+    (( NONINTERACTIVE )) || subsection "Account & Access"
+    NEW_USER="${NEW_USER:-}"
+    (( NONINTERACTIVE )) || NEW_USER=$(ask "New sudo user to create (blank to skip)" "$NEW_USER")
 
-    SHELL_TIMEOUT="n"
-    SHELL_TIMEOUT_SECS="900"
-    if confirm "Auto-logout idle interactive shells after 15 minutes?" "y"; then
-        SHELL_TIMEOUT="y"
-        SHELL_TIMEOUT_SECS=$(ask "Idle timeout in seconds" "900")
+    EXISTING_USER="${EXISTING_USER:-}"
+    SSH_PUBKEY="${SSH_PUBKEY:-}"
+    NEW_USER_PASSWORD="${NEW_USER_PASSWORD:-}"
+    if (( ! NONINTERACTIVE )); then
+        if [[ -n "$NEW_USER" ]] || confirm "Add an SSH public key to an existing user's authorized_keys?" "$( [[ -n "$SSH_PUBKEY" ]] && echo y || echo n )"; then
+            [[ -z "$NEW_USER" ]] && EXISTING_USER=$(ask "Which existing username?" "${EXISTING_USER:-${SUDO_USER:-}}")
+            SSH_PUBKEY=$(ask "Paste the SSH public key (blank to skip)" "$SSH_PUBKEY")
+        fi
     fi
 
-    subsection "System"
+    LOCK_ROOT=$(normalize_bool "${LOCK_ROOT:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Lock the root account password (on top of disabling root SSH login)?" "$LOCK_ROOT" && LOCK_ROOT="y" || LOCK_ROOT="n"; }
+
+    SHELL_TIMEOUT=$(normalize_bool "${SHELL_TIMEOUT:-}" "y")
+    SHELL_TIMEOUT_SECS="${SHELL_TIMEOUT_SECS:-900}"
+    if (( ! NONINTERACTIVE )); then
+        if confirm "Auto-logout idle interactive shells after 15 minutes?" "$SHELL_TIMEOUT"; then
+            SHELL_TIMEOUT="y"
+            SHELL_TIMEOUT_SECS=$(ask "Idle timeout in seconds" "$SHELL_TIMEOUT_SECS")
+        else
+            SHELL_TIMEOUT="n"
+        fi
+    fi
+
+    (( NONINTERACTIVE )) || subsection "System"
     CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
-    TIMEZONE=$(ask "Timezone" "$CURRENT_TZ")
+    TIMEZONE="${TIMEZONE:-$CURRENT_TZ}"
+    (( NONINTERACTIVE )) || TIMEZONE=$(ask "Timezone" "$TIMEZONE")
 
-    ENABLE_TIMESYNC="n"
-    confirm "Explicitly enable systemd-timesyncd for NTP (skipped if chrony/ntpd already active)?" "y" && ENABLE_TIMESYNC="y"
+    ENABLE_TIMESYNC=$(normalize_bool "${ENABLE_TIMESYNC:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Explicitly enable systemd-timesyncd for NTP (skipped if chrony/ntpd already active)?" "$ENABLE_TIMESYNC" && ENABLE_TIMESYNC="y" || ENABLE_TIMESYNC="n"; }
 
-    UU_CHECK_INTERVAL=$(ask "How often to check for updates (days)" "1")
-    UU_LEVEL=$(ask "Install automatically: security / all / none" "security")
+    UU_CHECK_INTERVAL="${UU_CHECK_INTERVAL:-1}"
+    (( NONINTERACTIVE )) || UU_CHECK_INTERVAL=$(ask "How often to check for updates (days)" "$UU_CHECK_INTERVAL")
+
+    UU_LEVEL="${UU_LEVEL:-security}"
+    (( NONINTERACTIVE )) || UU_LEVEL=$(ask "Install automatically: security / all / none" "$UU_LEVEL")
     case "$UU_LEVEL" in
         security|all|none) : ;;
         *) warn "Unrecognised value '$UU_LEVEL' — defaulting to 'security'."; UU_LEVEL="security" ;;
     esac
 
-    UU_INSTALL_TIME="03:00"
-    UU_AUTO_REBOOT="n"
-    UU_REBOOT_TIME="03:30"
-    UU_NTFY_URL=""
+    UU_INSTALL_TIME="${UU_INSTALL_TIME:-03:00}"
+    UU_AUTO_REBOOT=$(normalize_bool "${UU_AUTO_REBOOT:-}" "n")
+    UU_REBOOT_TIME="${UU_REBOOT_TIME:-03:30}"
+    UU_NTFY_URL="${UU_NTFY_URL:-}"
     if [[ "$UU_LEVEL" != "none" ]]; then
-        UU_INSTALL_TIME=$(ask "Time to run the daily update/install (24h HH:MM)" "03:00")
+        if (( ! NONINTERACTIVE )); then
+            UU_INSTALL_TIME=$(ask "Time to run the daily update/install (24h HH:MM)" "$UU_INSTALL_TIME")
+        fi
         [[ "$UU_INSTALL_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { warn "Invalid time '$UU_INSTALL_TIME' — defaulting to 03:00."; UU_INSTALL_TIME="03:00"; }
 
-        if confirm "Allow an automatic reboot if one is required after updates?" "n"; then
-            UU_AUTO_REBOOT="y"
-            UU_REBOOT_TIME=$(ask "Automatic reboot time (24h HH:MM)" "03:30")
+        if (( ! NONINTERACTIVE )); then
+            if confirm "Allow an automatic reboot if one is required after updates?" "$UU_AUTO_REBOOT"; then
+                UU_AUTO_REBOOT="y"
+                UU_REBOOT_TIME=$(ask "Automatic reboot time (24h HH:MM)" "$UU_REBOOT_TIME")
+            else
+                UU_AUTO_REBOOT="n"
+            fi
+        fi
+        if [[ "$UU_AUTO_REBOOT" == "y" ]]; then
             [[ "$UU_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { warn "Invalid time '$UU_REBOOT_TIME' — defaulting to 03:30."; UU_REBOOT_TIME="03:30"; }
         fi
 
-        if confirm "Send an ntfy summary after each run (packages available/patched, reboot status)? Uses its own topic, separate from SSH-login/fail2ban alerts." "y"; then
-            UU_NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "")
+        if (( ! NONINTERACTIVE )); then
+            if confirm "Send an ntfy summary after each run (packages available/patched, reboot status)? Uses its own topic, separate from SSH-login/fail2ban alerts." "$( [[ -n "$UU_NTFY_URL" ]] && echo y || echo n )"; then
+                UU_NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "$UU_NTFY_URL")
+            fi
         fi
     fi
 
-    subsection "SSH"
-    SSH_PORT=$(ask "SSH port to use" "22")
+    (( NONINTERACTIVE )) || subsection "SSH"
+    SSH_PORT="${SSH_PORT:-22}"
+    (( NONINTERACTIVE )) || SSH_PORT=$(ask "SSH port to use" "$SSH_PORT")
 
-    echo "Environment type:"
-    echo "  1) internal (LAN only, trusted network)"
-    echo "  2) external (internet-facing)"
-    local envchoice
-    envchoice=$(ask "Choose 1 or 2" "1")
-    if [[ "$envchoice" == "2" ]]; then ENV_TYPE="external"; else ENV_TYPE="internal"; fi
+    ENV_TYPE="${ENV_TYPE:-internal}"
+    if (( ! NONINTERACTIVE )); then
+        echo "Environment type:"
+        echo "  1) internal (LAN only, trusted network)"
+        echo "  2) external (internet-facing)"
+        local envchoice
+        envchoice=$(ask "Choose 1 or 2" "$( [[ "$ENV_TYPE" == "external" ]] && echo 2 || echo 1 )")
+        [[ "$envchoice" == "2" ]] && ENV_TYPE="external" || ENV_TYPE="internal"
+    fi
+    case "$ENV_TYPE" in
+        internal|external) : ;;
+        *) warn "Unrecognised ENV_TYPE '$ENV_TYPE' — defaulting to 'internal'."; ENV_TYPE="internal" ;;
+    esac
     info "Environment set to: $ENV_TYPE"
 
-    SSHAUDIT_HARDEN="n"
-    confirm "Apply strict ssh-audit cipher/KEX/MAC hardening? (safe, recommended)" "y" && SSHAUDIT_HARDEN="y"
+    SSHAUDIT_HARDEN=$(normalize_bool "${SSHAUDIT_HARDEN:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Apply strict ssh-audit cipher/KEX/MAC hardening? (safe, recommended)" "$SSHAUDIT_HARDEN" && SSHAUDIT_HARDEN="y" || SSHAUDIT_HARDEN="n"; }
 
-    REGEN_HOSTKEYS="n"
+    REGEN_HOSTKEYS=$(normalize_bool "${REGEN_HOSTKEYS:-}" "n")
     if [[ "$ENV_TYPE" == "external" ]]; then
-        confirm "Regenerate SSH host keys? (invasive — invalidates known_hosts on all existing clients)" "n" && REGEN_HOSTKEYS="y"
+        (( NONINTERACTIVE )) || { confirm "Regenerate SSH host keys? (invasive — invalidates known_hosts on all existing clients)" "$REGEN_HOSTKEYS" && REGEN_HOSTKEYS="y" || REGEN_HOSTKEYS="n"; }
+    else
+        REGEN_HOSTKEYS="n"
     fi
 
-    SSH_BANNER="n"
-    BANNER_TEXT="Authorized access only. All activity may be monitored and reported."
-    if confirm "Add an SSH pre-login banner?" "y"; then
-        SSH_BANNER="y"
-        BANNER_TEXT=$(ask "Banner text" "$BANNER_TEXT")
-    fi
-
-    SSH_EXTRA_LIMITS="n"
-    SSH_MAX_AUTH_TRIES="3"
-    SSH_LOGIN_GRACE_TIME="30"
-    SSH_CLIENT_ALIVE_INTERVAL="300"
-    SSH_CLIENT_ALIVE_COUNT_MAX="2"
-    if confirm "Apply extra SSH limits (MaxAuthTries=${SSH_MAX_AUTH_TRIES}, LoginGraceTime=${SSH_LOGIN_GRACE_TIME}s, ClientAliveInterval=${SSH_CLIENT_ALIVE_INTERVAL}s, ClientAliveCountMax=${SSH_CLIENT_ALIVE_COUNT_MAX}, X11Forwarding=no)?" "y"; then
-        SSH_EXTRA_LIMITS="y"
-        if confirm "Use those defaults?" "y"; then
-            :
+    SSH_BANNER=$(normalize_bool "${SSH_BANNER:-}" "y")
+    BANNER_TEXT="${BANNER_TEXT:-Authorized access only. All activity may be monitored and reported.}"
+    if (( ! NONINTERACTIVE )); then
+        if confirm "Add an SSH pre-login banner?" "$SSH_BANNER"; then
+            SSH_BANNER="y"
+            BANNER_TEXT=$(ask "Banner text" "$BANNER_TEXT")
         else
-            SSH_MAX_AUTH_TRIES=$(ask "MaxAuthTries (failed login attempts before disconnect)" "$SSH_MAX_AUTH_TRIES")
-            SSH_LOGIN_GRACE_TIME=$(ask "LoginGraceTime in seconds (time allowed to authenticate)" "$SSH_LOGIN_GRACE_TIME")
-            SSH_CLIENT_ALIVE_INTERVAL=$(ask "ClientAliveInterval in seconds (idle keepalive check)" "$SSH_CLIENT_ALIVE_INTERVAL")
-            SSH_CLIENT_ALIVE_COUNT_MAX=$(ask "ClientAliveCountMax (missed keepalives before disconnect)" "$SSH_CLIENT_ALIVE_COUNT_MAX")
+            SSH_BANNER="n"
         fi
     fi
 
-    subsection "Firewall"
-    LAN_CIDRS=""
+    SSH_EXTRA_LIMITS=$(normalize_bool "${SSH_EXTRA_LIMITS:-}" "y")
+    SSH_MAX_AUTH_TRIES="${SSH_MAX_AUTH_TRIES:-3}"
+    SSH_LOGIN_GRACE_TIME="${SSH_LOGIN_GRACE_TIME:-30}"
+    SSH_CLIENT_ALIVE_INTERVAL="${SSH_CLIENT_ALIVE_INTERVAL:-300}"
+    SSH_CLIENT_ALIVE_COUNT_MAX="${SSH_CLIENT_ALIVE_COUNT_MAX:-2}"
+    if (( ! NONINTERACTIVE )); then
+        if confirm "Apply extra SSH limits (MaxAuthTries=${SSH_MAX_AUTH_TRIES}, LoginGraceTime=${SSH_LOGIN_GRACE_TIME}s, ClientAliveInterval=${SSH_CLIENT_ALIVE_INTERVAL}s, ClientAliveCountMax=${SSH_CLIENT_ALIVE_COUNT_MAX}, X11Forwarding=no)?" "$SSH_EXTRA_LIMITS"; then
+            SSH_EXTRA_LIMITS="y"
+            if confirm "Use those defaults?" "y"; then
+                :
+            else
+                SSH_MAX_AUTH_TRIES=$(ask "MaxAuthTries (failed login attempts before disconnect)" "$SSH_MAX_AUTH_TRIES")
+                SSH_LOGIN_GRACE_TIME=$(ask "LoginGraceTime in seconds (time allowed to authenticate)" "$SSH_LOGIN_GRACE_TIME")
+                SSH_CLIENT_ALIVE_INTERVAL=$(ask "ClientAliveInterval in seconds (idle keepalive check)" "$SSH_CLIENT_ALIVE_INTERVAL")
+                SSH_CLIENT_ALIVE_COUNT_MAX=$(ask "ClientAliveCountMax (missed keepalives before disconnect)" "$SSH_CLIENT_ALIVE_COUNT_MAX")
+            fi
+        else
+            SSH_EXTRA_LIMITS="n"
+        fi
+    fi
+
+    (( NONINTERACTIVE )) || subsection "Firewall"
+    LAN_CIDRS="${LAN_CIDRS:-192.168.1.0/24}"
     if [[ "$ENV_TYPE" == "internal" ]]; then
-        LAN_CIDRS=$(ask "Comma-separated CIDR ranges allowed to reach SSH (e.g. 192.168.1.0/24,192.168.2.0/24)" "192.168.1.0/24")
+        (( NONINTERACTIVE )) || LAN_CIDRS=$(ask "Comma-separated CIDR ranges allowed to reach SSH (e.g. 192.168.1.0/24,192.168.2.0/24)" "$LAN_CIDRS")
+    else
+        LAN_CIDRS=""
     fi
 
-    UFW_LOGGING="n"
-    confirm "Enable UFW firewall logging?" "y" && UFW_LOGGING="y"
+    UFW_LOGGING=$(normalize_bool "${UFW_LOGGING:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Enable UFW firewall logging?" "$UFW_LOGGING" && UFW_LOGGING="y" || UFW_LOGGING="n"; }
 
-    subsection "Intrusion Prevention"
-    ENABLE_NTFY="n"
-    NTFY_URL=""
-    if confirm "Enable ntfy notifications (SSH logins + fail2ban bans)?" "n"; then
-        ENABLE_NTFY="y"
-        NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "")
-        [[ -z "$NTFY_URL" ]] && { warn "No URL given — disabling ntfy."; ENABLE_NTFY="n"; }
+    (( NONINTERACTIVE )) || subsection "Intrusion Prevention"
+    ENABLE_NTFY=$(normalize_bool "${ENABLE_NTFY:-}" "n")
+    NTFY_URL="${NTFY_URL:-}"
+    if (( ! NONINTERACTIVE )); then
+        if confirm "Enable ntfy notifications (SSH logins + fail2ban bans)?" "$ENABLE_NTFY"; then
+            ENABLE_NTFY="y"
+            NTFY_URL=$(ask "Full ntfy topic URL (e.g. https://ntfy.example.com/mytopic)" "$NTFY_URL")
+        else
+            ENABLE_NTFY="n"
+        fi
+    fi
+    if [[ "$ENABLE_NTFY" == "y" && -z "$NTFY_URL" ]]; then
+        warn "ENABLE_NTFY is on but NTFY_URL is blank — disabling ntfy."
+        ENABLE_NTFY="n"
     fi
 
-    F2B_IGNOREIP=""
+    F2B_IGNOREIP="${F2B_IGNOREIP:-}"
     if [[ "$ENV_TYPE" == "internal" ]]; then
-        F2B_IGNOREIP=$(ask "IP(s) fail2ban should never ban (space-separated, e.g. your admin workstation)" "")
+        (( NONINTERACTIVE )) || F2B_IGNOREIP=$(ask "IP(s) fail2ban should never ban (space-separated, e.g. your admin workstation)" "$F2B_IGNOREIP")
+    else
+        F2B_IGNOREIP=""
     fi
 
-    subsection "Kernel & Resource Limits"
-    SYSCTL_HARDEN="n"
+    (( NONINTERACTIVE )) || subsection "Kernel & Resource Limits"
     local sysctl_default="n"; [[ "$ENV_TYPE" == "external" ]] && sysctl_default="y"
-    confirm "Apply sysctl network hardening (anti-spoofing, disable redirects)?" "$sysctl_default" && SYSCTL_HARDEN="y"
+    SYSCTL_HARDEN=$(normalize_bool "${SYSCTL_HARDEN:-}" "$sysctl_default")
+    (( NONINTERACTIVE )) || { confirm "Apply sysctl network hardening (anti-spoofing, disable redirects)?" "$SYSCTL_HARDEN" && SYSCTL_HARDEN="y" || SYSCTL_HARDEN="n"; }
 
-    STRICT_SYSCTL="n"
-    confirm "Apply stricter kernel sysctls (ASLR, dmesg/kptr restrict, TCP syncookies, disable sysrq, ICMP hardening)?" "y" && STRICT_SYSCTL="y"
+    STRICT_SYSCTL=$(normalize_bool "${STRICT_SYSCTL:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Apply stricter kernel sysctls (ASLR, dmesg/kptr restrict, TCP syncookies, disable sysrq, ICMP hardening)?" "$STRICT_SYSCTL" && STRICT_SYSCTL="y" || STRICT_SYSCTL="n"; }
 
-    DISABLE_COREDUMPS="n"
-    confirm "Disable core dumps?" "y" && DISABLE_COREDUMPS="y"
+    DISABLE_COREDUMPS=$(normalize_bool "${DISABLE_COREDUMPS:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Disable core dumps?" "$DISABLE_COREDUMPS" && DISABLE_COREDUMPS="y" || DISABLE_COREDUMPS="n"; }
 
-    BLACKLIST_PROTOCOLS="n"
-    confirm "Blacklist rarely-used network protocols (dccp, sctp, rds, tipc)?" "y" && BLACKLIST_PROTOCOLS="y"
+    BLACKLIST_PROTOCOLS=$(normalize_bool "${BLACKLIST_PROTOCOLS:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Blacklist rarely-used network protocols (dccp, sctp, rds, tipc)?" "$BLACKLIST_PROTOCOLS" && BLACKLIST_PROTOCOLS="y" || BLACKLIST_PROTOCOLS="n"; }
 
-    subsection "Auditing & Compliance"
-    ENABLE_AUDITD="n"
-    confirm "Enable auditd (logs changes to key files like passwd/shadow/sudoers)?" "y" && ENABLE_AUDITD="y"
+    (( NONINTERACTIVE )) || subsection "Auditing & Compliance"
+    ENABLE_AUDITD=$(normalize_bool "${ENABLE_AUDITD:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Enable auditd (logs changes to key files like passwd/shadow/sudoers)?" "$ENABLE_AUDITD" && ENABLE_AUDITD="y" || ENABLE_AUDITD="n"; }
 
-    CHECK_APPARMOR="n"
-    confirm "Check AppArmor status and report any unenforced profiles?" "y" && CHECK_APPARMOR="y"
+    CHECK_APPARMOR=$(normalize_bool "${CHECK_APPARMOR:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Check AppArmor status and report any unenforced profiles?" "$CHECK_APPARMOR" && CHECK_APPARMOR="y" || CHECK_APPARMOR="n"; }
 
-    PASSWORD_POLICY="n"
-    PW_MINLEN="12"
-    if confirm "Apply a password quality policy (applies to future password changes only, won't lock out current sessions)?" "y"; then
-        PASSWORD_POLICY="y"
-        PW_MINLEN=$(ask "Minimum password length" "12")
+    PASSWORD_POLICY=$(normalize_bool "${PASSWORD_POLICY:-}" "y")
+    PW_MINLEN="${PW_MINLEN:-12}"
+    if (( ! NONINTERACTIVE )); then
+        if confirm "Apply a password quality policy (applies to future password changes only, won't lock out current sessions)?" "$PASSWORD_POLICY"; then
+            PASSWORD_POLICY="y"
+            PW_MINLEN=$(ask "Minimum password length" "$PW_MINLEN")
+        else
+            PASSWORD_POLICY="n"
+        fi
     fi
 
-    JOURNALD_PERSIST="n"
-    confirm "Make systemd journal logs persistent across reboots?" "y" && JOURNALD_PERSIST="y"
+    JOURNALD_PERSIST=$(normalize_bool "${JOURNALD_PERSIST:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Make systemd journal logs persistent across reboots?" "$JOURNALD_PERSIST" && JOURNALD_PERSIST="y" || JOURNALD_PERSIST="n"; }
 
-    ENABLE_ROOTKIT="n"
-    confirm "Install rkhunter + chkrootkit with a weekly scan?" "y" && ENABLE_ROOTKIT="y"
+    ENABLE_ROOTKIT=$(normalize_bool "${ENABLE_ROOTKIT:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Install rkhunter + chkrootkit with a weekly scan?" "$ENABLE_ROOTKIT" && ENABLE_ROOTKIT="y" || ENABLE_ROOTKIT="n"; }
 
-    ENABLE_ACCOUNTING="n"
-    confirm "Enable process accounting and sysstat (acct + sysstat)?" "y" && ENABLE_ACCOUNTING="y"
+    ENABLE_ACCOUNTING=$(normalize_bool "${ENABLE_ACCOUNTING:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Enable process accounting and sysstat (acct + sysstat)?" "$ENABLE_ACCOUNTING" && ENABLE_ACCOUNTING="y" || ENABLE_ACCOUNTING="n"; }
 
-    subsection "Cleanup"
-    TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "7d")
-    TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "")
+    FIX_NOPASSWD_SUDOERS=$(normalize_bool "${FIX_NOPASSWD_SUDOERS:-}" "y")
+    SUDO_USER_PASSWORDS="${SUDO_USER_PASSWORDS:-}"
 
-    LOGROTATE_WEEKS=$(ask "How many weekly log rotations to keep in /var/log/*.log" "4")
+    (( NONINTERACTIVE )) || subsection "Cleanup"
+    TMPREAPER_TIME="${TMPREAPER_TIME:-7d}"
+    (( NONINTERACTIVE )) || TMPREAPER_TIME=$(ask "Max age for tmpreaper to clear files in /tmp and /var/tmp" "$TMPREAPER_TIME")
 
-    subsection "Verification"
-    RUN_DEBSUMS="n"
-    confirm "Verify installed package files against their checksums (debsums)?" "y" && RUN_DEBSUMS="y"
+    TMPREAPER_EXTRA="${TMPREAPER_EXTRA:-}"
+    (( NONINTERACTIVE )) || TMPREAPER_EXTRA=$(ask "Extra directories for tmpreaper to clean (space-separated, blank for none)" "$TMPREAPER_EXTRA")
 
-    RUN_SSHAUDIT="n"
-    confirm "Run ssh-audit against localhost after hardening to verify the config?" "y" && RUN_SSHAUDIT="y"
+    LOGROTATE_WEEKS="${LOGROTATE_WEEKS:-4}"
+    (( NONINTERACTIVE )) || LOGROTATE_WEEKS=$(ask "How many weekly log rotations to keep in /var/log/*.log" "$LOGROTATE_WEEKS")
 
-    RUN_LYNIS="n"
-    confirm "Run Lynis before and after hardening to compare the hardening index and summarize findings?" "y" && RUN_LYNIS="y"
+    (( NONINTERACTIVE )) || subsection "Verification"
+    RUN_DEBSUMS=$(normalize_bool "${RUN_DEBSUMS:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Verify installed package files against their checksums (debsums)?" "$RUN_DEBSUMS" && RUN_DEBSUMS="y" || RUN_DEBSUMS="n"; }
+
+    RUN_SSHAUDIT=$(normalize_bool "${RUN_SSHAUDIT:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Run ssh-audit against localhost after hardening to verify the config?" "$RUN_SSHAUDIT" && RUN_SSHAUDIT="y" || RUN_SSHAUDIT="n"; }
+
+    RUN_LYNIS=$(normalize_bool "${RUN_LYNIS:-}" "y")
+    (( NONINTERACTIVE )) || { confirm "Run Lynis before and after hardening to compare the hardening index and summarize findings?" "$RUN_LYNIS" && RUN_LYNIS="y" || RUN_LYNIS="n"; }
 
     echo
     info "Configuration collected. Proceeding — review each section's warnings as it runs."
@@ -464,6 +693,16 @@ setup_user() {
     if [[ -n "$NEW_USER" ]]; then
         if id "$NEW_USER" &>/dev/null; then
             info "User $NEW_USER already exists — skipping creation."
+        elif (( NONINTERACTIVE )); then
+            info "Creating user $NEW_USER (non-interactive)..."
+            adduser --disabled-password --gecos "" "$NEW_USER" || { err "Failed to create user $NEW_USER."; return 1; }
+            if [[ -n "${NEW_USER_PASSWORD:-}" ]]; then
+                set_user_password "$NEW_USER" "$NEW_USER_PASSWORD" \
+                    && info "Password set for $NEW_USER." \
+                    || warn "Could not set password for $NEW_USER."
+            else
+                warn "No NEW_USER_PASSWORD supplied — '$NEW_USER' has NO password. Sudo will not work for this account until one is set with 'sudo passwd $NEW_USER'."
+            fi
         else
             info "Creating user $NEW_USER (you'll be prompted to set a password)..."
             adduser "$NEW_USER" || { err "Failed to create user $NEW_USER."; return 1; }
@@ -516,7 +755,13 @@ audit_sudo_access() {
     files=$(grep -rl "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v '\.harden-bak$' || true)
     for f in $files; do
         [[ -f "$f" ]] || continue
-        if confirm "Found NOPASSWD entries in $f — require a password there too?" "y"; then
+        local do_fix="n"
+        if (( NONINTERACTIVE )); then
+            do_fix="${FIX_NOPASSWD_SUDOERS:-y}"
+        else
+            confirm "Found NOPASSWD entries in $f — require a password there too?" "y" && do_fix="y"
+        fi
+        if [[ "$do_fix" == "y" ]]; then
             backup_file "$f"
             sed -i 's/NOPASSWD:/PASSWD:/' "$f"
             info "Updated $f to require a password for sudo."
@@ -530,8 +775,19 @@ audit_sudo_access() {
         local status; status=$(passwd -S "$u" 2>/dev/null | awk '{print $2}')
         case "$status" in
             L)
-                if confirm "User '$u' has sudo access but their password is locked/unset — set a real password now? (this replaces the lock with a working password)" "y"; then
-                    passwd "$u" || warn "Could not set a password for '$u'."
+                if (( NONINTERACTIVE )); then
+                    local secret; secret=$(lookup_sudo_password "$u")
+                    if [[ -n "$secret" ]]; then
+                        set_user_password "$u" "$secret" \
+                            && info "Password set for '$u' (was locked/unset)." \
+                            || warn "Could not set password for '$u'."
+                    else
+                        warn "User '$u' has sudo access but their password is locked/unset — no matching entry in SUDO_USER_PASSWORDS, leaving as-is. Sudo will not work for this account until a password is set manually."
+                    fi
+                else
+                    if confirm "User '$u' has sudo access but their password is locked/unset — set a real password now? (this replaces the lock with a working password)" "y"; then
+                        passwd "$u" || warn "Could not set a password for '$u'."
+                    fi
                 fi
                 ;;
             P)
@@ -1106,6 +1362,29 @@ setup_rootkit_scanners() {
     [[ "$ENABLE_ROOTKIT" == "y" ]] || return 0
     pkg_install rkhunter chkrootkit || true
 
+    # Tune rkhunter to suppress known, well-documented false positives:
+    # - WEB_CMD default is a relative path on some installs, which rkhunter
+    #   itself flags as invalid at every run.
+    # - /etc/.updated and /etc/.resolv.conf.systemd-resolved.bak are normal
+    #   systemd/package-manager artifacts, not hidden-file rootkit signs.
+    if [[ -f /etc/rkhunter.conf ]]; then
+        backup_file /etc/rkhunter.conf
+        if (( DRY_RUN )); then
+            echo "${LOG_PREFIX} would append false-positive suppressions to /etc/rkhunter.conf"
+        else
+            {
+                echo ""
+                echo "# Managed by harden.sh — suppress known false positives"
+                echo 'WEB_CMD=""'
+                echo "ALLOWHIDDENFILE=/etc/.updated"
+                echo "ALLOWHIDDENFILE=/etc/.resolv.conf.systemd-resolved.bak"
+            } >> /etc/rkhunter.conf
+        fi
+        info "Tuned rkhunter config to suppress known false positives (WEB_CMD, known hidden files)."
+    elif (( DRY_RUN )); then
+        echo "${LOG_PREFIX} would append false-positive suppressions to /etc/rkhunter.conf (after install)"
+    fi
+
     if command -v rkhunter &>/dev/null; then
         run "rkhunter --propupd (baseline file properties)" -- rkhunter --propupd &>/dev/null
     fi
@@ -1113,8 +1392,19 @@ setup_rootkit_scanners() {
     write_file /usr/bin/scripts/rootkit-scan.sh <<EOF
 #!/bin/bash
 # Managed by harden.sh — weekly rootkit scan, alerts only on findings.
+#
+# Self-baselining: the first run on a fresh box captures whatever
+# rkhunter/chkrootkit report at that point as the accepted baseline for
+# THIS server (a new-user-added warning for a mail package the OS itself
+# installed isn't a threat — an unexplained one three months later is).
+# Every run after that only alerts on lines that weren't in the baseline.
+# To accept new findings as normal going forward (e.g. after intentionally
+# installing a new service), delete the relevant file under
+# /var/lib/harden-rootkit-scan/ and the next run re-baselines it.
 LOG=/var/log/harden-rootkit-scan.log
 NTFY_URL="${NTFY_URL}"
+BASELINE_DIR=/var/lib/harden-rootkit-scan
+mkdir -p "\$BASELINE_DIR"
 {
   echo "=== \$(date) ==="
   FINDINGS=0
@@ -1122,12 +1412,42 @@ NTFY_URL="${NTFY_URL}"
   if command -v rkhunter &>/dev/null; then
       rkhunter --update --quiet 2>/dev/null
       rkhunter --check --skip-keypress --report-warnings-only 2>&1 | tee /tmp/rkhunter.out
-      grep -qi "warning" /tmp/rkhunter.out && FINDINGS=\$((FINDINGS+1))
+      # Known rkhunter bug: it only greps the literal sshd_config file and
+      # doesn't resolve Include'd drop-ins, so it always reports
+      # PermitRootLogin as unset even though harden.sh's drop-in sets it
+      # (verified separately by the ssh-audit check) — filtered out
+      # entirely rather than baselined, since it's not a real signal.
+      grep -vi "SSH configuration option 'PermitRootLogin'" /tmp/rkhunter.out \\
+          | grep -i "warning" | sort -u > /tmp/rkhunter.current
+      if [[ ! -f "\$BASELINE_DIR/rkhunter.baseline" ]]; then
+          cp /tmp/rkhunter.current "\$BASELINE_DIR/rkhunter.baseline"
+          echo "rkhunter: first run — baseline established with \$(wc -l < /tmp/rkhunter.current) item(s), not alerting."
+      else
+          new_items=\$(comm -13 "\$BASELINE_DIR/rkhunter.baseline" /tmp/rkhunter.current)
+          if [[ -n "\$new_items" ]]; then
+              echo "rkhunter: new warnings since baseline:"
+              echo "\$new_items"
+              FINDINGS=\$((FINDINGS+1))
+          fi
+      fi
   fi
 
   if command -v chkrootkit &>/dev/null; then
-      chkrootkit 2>&1 | grep -i "INFECTED" > /tmp/chkrootkit.out
-      [[ -s /tmp/chkrootkit.out ]] && { cat /tmp/chkrootkit.out; FINDINGS=\$((FINDINGS+1)); }
+      # chkrootkit's own convention: clean results say "not infected"
+      # (lowercase), an actual finding says "INFECTED" (uppercase) — must
+      # be case-sensitive here, or every clean line matches too.
+      chkrootkit 2>&1 | tee /tmp/chkrootkit-full.out | grep "INFECTED" | sort -u > /tmp/chkrootkit.current
+      if [[ ! -f "\$BASELINE_DIR/chkrootkit.baseline" ]]; then
+          cp /tmp/chkrootkit.current "\$BASELINE_DIR/chkrootkit.baseline"
+          [[ -s /tmp/chkrootkit.current ]] && echo "chkrootkit: first run — baseline established with \$(wc -l < /tmp/chkrootkit.current) item(s), not alerting."
+      else
+          new_items=\$(comm -13 "\$BASELINE_DIR/chkrootkit.baseline" /tmp/chkrootkit.current)
+          if [[ -n "\$new_items" ]]; then
+              echo "chkrootkit: new findings since baseline:"
+              echo "\$new_items"
+              FINDINGS=\$((FINDINGS+1))
+          fi
+      fi
   fi
 
   if [[ \$FINDINGS -gt 0 && -n "\$NTFY_URL" ]]; then
@@ -1141,9 +1461,13 @@ EOF
 
     if (( DRY_RUN )); then
         echo "${LOG_PREFIX} would schedule weekly rootkit scan (Sundays 04:00)"
+        echo "${LOG_PREFIX} would run: /usr/bin/scripts/rootkit-scan.sh (establish baseline immediately)"
     else
         ( crontab -l 2>/dev/null | grep -v 'rootkit-scan.sh' ; echo "0 4 * * 0 /usr/bin/scripts/rootkit-scan.sh" ) | crontab -
         info "Weekly rootkit scan scheduled (Sundays 04:00), alerts on findings only."
+        info "Running the first scan now to establish this server's baseline (a couple of minutes)..."
+        /usr/bin/scripts/rootkit-scan.sh
+        info "Baseline established — see /var/log/harden-rootkit-scan.log."
     fi
 }
 
@@ -1423,16 +1747,33 @@ print_summary() {
 # Main
 # ------------------------------------------------------------------------
 main() {
-    # If stdin isn't already a terminal (e.g. this script is being piped in
-    # via `curl ... | bash`), re-point it at /dev/tty so every prompt below
-    # — ours and any external command's, like adduser's password prompt —
-    # reads from the keyboard instead of the exhausted pipe.
-    if [[ ! -t 0 ]]; then
-        if [[ -r /dev/tty ]]; then
-            exec < /dev/tty
-        else
-            err "No terminal available for interactive prompts (running non-interactively with no /dev/tty?)."
+    if (( NONINTERACTIVE )); then
+        if [[ -z "$CONFIG_FILE" ]]; then
+            err "--config/-c requires a file path."
             exit 1
+        fi
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            err "Config file not found: $CONFIG_FILE"
+            exit 1
+        fi
+        # shellcheck disable=SC1090
+        if ! source "$CONFIG_FILE"; then
+            err "Failed to read config file: $CONFIG_FILE (check it's valid shell — KEY=\"value\" per line)."
+            exit 1
+        fi
+        info "Loaded config from $CONFIG_FILE — running non-interactively, no prompts."
+    else
+        # If stdin isn't already a terminal (e.g. this script is being piped
+        # in via `curl ... | bash`), re-point it at /dev/tty so every prompt
+        # below — ours and any external command's, like adduser's password
+        # prompt — reads from the keyboard instead of the exhausted pipe.
+        if [[ ! -t 0 ]]; then
+            if [[ -r /dev/tty ]]; then
+                exec < /dev/tty
+            else
+                err "No terminal available for interactive prompts (running non-interactively with no /dev/tty?)."
+                exit 1
+            fi
         fi
     fi
 
