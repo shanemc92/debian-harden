@@ -113,6 +113,11 @@ revert_ssh() {
         restore_backup /etc/ssh/sshd_config || true
         if sshd -t 2>/tmp/harden-undo-sshd.log; then
             if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
+                if [[ -f /etc/systemd/system/ssh.socket.d/override.conf ]]; then
+                    rm -f /etc/systemd/system/ssh.socket.d/override.conf
+                    systemctl daemon-reload
+                    systemctl restart ssh.socket 2>/dev/null || true
+                fi
                 ok "SSH hardening reverted and service restarted on the default port (22)."
                 warn "If UFW only allows your custom SSH port, add a rule for port 22 too (or whatever port you're now using) before you disconnect."
             else

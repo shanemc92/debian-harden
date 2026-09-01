@@ -133,17 +133,23 @@ harden.sh - interactive Debian/Ubuntu hardening and auto-cleanup setup.
 
 Usage: sudo bash harden.sh [options]
 
-  --dry-run, -n        Report exactly what would change without modifying
-                        anything or installing packages.
-  --config, -c <file>  Read all answers from <file> instead of prompting —
-                        runs completely non-interactively. See
-                        --print-config for every available setting.
-  --print-config        Print a fully-commented template config file to
-                        stdout and exit (redirect it to a file to start
-                        from it: sudo bash harden.sh --print-config > harden.conf).
-  --help, -h            Show this message.
+  --dry-run, -n          Report exactly what would change without modifying
+                          anything or installing packages.
+  --config, -c <file>    Read all answers from <file> instead of prompting —
+                          runs completely non-interactively.
+  --config-b64 <string>  Same as --config, but the file content is passed
+                          base64-encoded — handy for a one-line snippet in
+                          an SSH client, where you can't easily attach a
+                          separate file. Falls back to the HARDEN_CONFIG_B64
+                          environment variable if this flag isn't given.
+  --print-config          Print a fully-commented template config file to
+                          stdout and exit (redirect it to a file to start
+                          from it: sudo bash harden.sh --print-config > harden.conf).
+  --help, -h              Show this message.
 USAGE
 }
+
+CONFIG_B64=""
 
 args=("$@")
 i=0
@@ -164,6 +170,15 @@ while (( i < ${#args[@]} )); do
             CONFIG_FILE="${arg#--config=}"
             NONINTERACTIVE=1
             ;;
+        --config-b64)
+            i=$((i+1))
+            CONFIG_B64="${args[$i]:-}"
+            NONINTERACTIVE=1
+            ;;
+        --config-b64=*)
+            CONFIG_B64="${arg#--config-b64=}"
+            NONINTERACTIVE=1
+            ;;
         --print-config)
             print_config_template
             exit 0
@@ -180,6 +195,25 @@ while (( i < ${#args[@]} )); do
     esac
     i=$((i+1))
 done
+
+# Fall back to the HARDEN_CONFIG_B64 env var if no --config/--config-b64 flag
+# was given — handy for an SSH-client snippet where you'd rather not paste
+# a long base64 blob as a literal command-line argument.
+if [[ -z "$CONFIG_FILE" && -z "$CONFIG_B64" && -n "${HARDEN_CONFIG_B64:-}" ]]; then
+    CONFIG_B64="$HARDEN_CONFIG_B64"
+    NONINTERACTIVE=1
+fi
+
+if [[ -n "$CONFIG_B64" ]]; then
+    TMP_CONFIG=$(mktemp /tmp/harden-config.XXXXXX)
+    chmod 600 "$TMP_CONFIG"
+    trap 'command rm -f "$TMP_CONFIG"' EXIT
+    if ! echo "$CONFIG_B64" | base64 -d > "$TMP_CONFIG" 2>/dev/null; then
+        echo "[harden] ERROR: --config-b64/HARDEN_CONFIG_B64 is not valid base64." >&2
+        exit 1
+    fi
+    CONFIG_FILE="$TMP_CONFIG"
+fi
 
 info()  { echo -e "${LOG_PREFIX} $*"; }
 warn()  { echo -e "${LOG_PREFIX} ${C_YELLOW}${C_BOLD}WARNING:${C_RESET} $*" >&2; }
@@ -1004,13 +1038,22 @@ setup_ssh() {
             restart_ok=1
         fi
         # On Ubuntu 22.10+/24.04+, SSH is socket-activated: ssh.socket owns
-        # the listening port, and restarting ssh.service alone does NOT
-        # move it — only a daemon-reload + ssh.socket restart does. Skip
-        # silently if this system doesn't use socket activation at all.
+        # the listening port. Relying on the auto-generated socket config
+        # to pick up Port from sshd_config turns out to be unreliable (a
+        # known systemd/Ubuntu quirk — the generator doesn't consistently
+        # honor it) — so an explicit ListenStream override is written
+        # directly instead, which is the documented-reliable method.
+        # Skipped entirely on systems without socket activation.
         if systemctl list-unit-files ssh.socket &>/dev/null && systemctl is-enabled ssh.socket &>/dev/null; then
+            mkdir -p /etc/systemd/system/ssh.socket.d
+            {
+                echo "[Socket]"
+                echo "ListenStream="
+                echo "ListenStream=0.0.0.0:${SSH_PORT}"
+            } | write_file /etc/systemd/system/ssh.socket.d/override.conf
             systemctl daemon-reload
             if systemctl restart ssh.socket 2>/dev/null; then
-                info "Restarted ssh.socket (socket-activated SSH) so the port change takes effect."
+                info "Applied explicit ssh.socket override for port ${SSH_PORT}."
             else
                 warn "Could not restart ssh.socket — the port change may not have taken effect. Check 'systemctl status ssh.socket'."
                 restart_ok=0

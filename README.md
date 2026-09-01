@@ -105,6 +105,30 @@ shown in the template, so you only need to include what you want to
 change. Combine with `--dry-run` to preview a config file's effect before
 running it for real.
 
+### As a one-line snippet (base64)
+
+For pasting into an SSH client's saved-command/snippet feature — where
+you'd rather not manage a separate file — the whole config can be passed
+base64-encoded, either as a flag or via an environment variable:
+
+```bash
+CONFIG_B64=$(base64 -w0 harden.conf)
+
+# as a single command:
+sudo bash -c "$(curl -fsSL <url>/harden.sh)" -- --config-b64 "$CONFIG_B64"
+
+# or via the environment (needs sudo -E to preserve it):
+export HARDEN_CONFIG_B64="$CONFIG_B64"
+sudo -E bash -c "$(curl -fsSL <url>/harden.sh)"
+```
+
+It's decoded to a `chmod 600` temp file that's deleted on exit (including
+under `--dry-run`) — the same secrets (`NEW_USER_PASSWORD`,
+`SUDO_USER_PASSWORDS`) that apply to a plain `--config` file apply here
+too, so treat the base64 blob itself as a secret — anyone who can read
+your shell history or the SSH client's saved snippet can decode it back
+to plaintext.
+
 Two settings exist only for non-interactive use (there's no sensible way
 to prompt for them, since they need to key off usernames the box may
 already have):
@@ -221,13 +245,19 @@ remove one manually with `userdel` if needed.
   `sshd -t` validates the config before any restart; if validation fails,
   the drop-in is removed and the existing session is left untouched.
 - On Ubuntu 22.10+ (including 24.04 LTS), SSH is socket-activated:
-  `ssh.socket` owns the actual listening port, and restarting
-  `ssh.service` alone does **not** move it — only `systemctl daemon-reload`
-  followed by `systemctl restart ssh.socket` does. The script detects
-  socket activation and does both; on systems without it (Debian,
-  Raspberry Pi OS, older Ubuntu) this is skipped entirely. It also checks
-  with `ss -ltn` afterward that something is actually listening on the
-  configured port before declaring success.
+  `ssh.socket` owns the actual listening port, not `ssh.service`. Simply
+  restarting the service after changing `Port` in the drop-in doesn't
+  move it — and even the documented `systemctl daemon-reload` +
+  `systemctl restart ssh.socket` fix isn't fully reliable either, since
+  it depends on a systemd generator correctly re-deriving the port from
+  `sshd_config` (a known source of flakiness). The script instead writes
+  an explicit `ListenStream` override directly to
+  `/etc/systemd/system/ssh.socket.d/override.conf`, which is the
+  documented-reliable method, then reloads and restarts. Skipped
+  entirely on systems without socket activation (Debian, Raspberry Pi
+  OS, older Ubuntu). It also checks with `ss -ltn` afterward that
+  something is actually listening on the configured port before
+  declaring success.
 - The SSH drop-in sets `AddressFamily inet` (IPv4 only), so the
   post-hardening `ssh-audit` verification connects to `127.0.0.1`
   explicitly rather than `localhost` — on Ubuntu, `localhost` commonly
