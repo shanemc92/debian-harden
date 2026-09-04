@@ -1,0 +1,91 @@
+# harden.sh config file — KEY=VALUE, one per line, quoting anything with
+# spaces. Values are taken literally (nothing is expanded or executed),
+# so a password hash containing $ is safe to use quoted or unquoted.
+# Booleans accept y/n (yes/true/1 also work).
+# Run with: sudo bash harden.sh --config harden.conf
+#
+# Anything left unset falls back to the same default shown here, so you
+# only need to include the values you want to change from default.
+
+## Account & Access
+NEW_USER=""                    # new sudo user to create, blank to skip
+EXISTING_USER=""                # used instead of NEW_USER if that's blank and SSH_PUBKEY is set
+SSH_PUBKEY=""                   # public key to install for NEW_USER/EXISTING_USER, blank to skip
+NEW_USER_PASSWORD=""            # plaintext, or a crypt hash (starting with $) from mkpasswd -m sha-512
+LOCK_ROOT="y"
+SHELL_TIMEOUT="y"
+SHELL_TIMEOUT_SECS="900"
+
+## System
+TIMEZONE="UTC"
+ENABLE_TIMESYNC="y"
+UU_CHECK_INTERVAL="1"
+UU_LEVEL="security"             # security | all | none
+UU_INSTALL_TIME="03:00"
+UU_AUTO_REBOOT="n"
+UU_REBOOT_TIME="03:30"
+UU_NTFY_URL=""                  # separate ntfy topic for the update summary
+
+## SSH
+SSH_PORT="22"
+ENV_TYPE="internal"             # internal | external
+SSHAUDIT_HARDEN="y"
+REGEN_HOSTKEYS="n"              # only asked/applied when ENV_TYPE=external
+SSH_BANNER="y"
+BANNER_TEXT="Authorized access only. All activity may be monitored and reported."
+SSH_EXTRA_LIMITS="y"
+SSH_MAX_AUTH_TRIES="3"
+SSH_LOGIN_GRACE_TIME="30"
+SSH_CLIENT_ALIVE_INTERVAL="300"
+SSH_CLIENT_ALIVE_COUNT_MAX="2"
+
+## Firewall
+LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal; comma-separate for multiple ranges, e.g. "192.168.1.0/24,10.0.0.0/8"
+UFW_LOGGING="y"
+
+## Intrusion Prevention
+ENABLE_NTFY="n"
+NTFY_URL=""                     # ntfy topic for SSH-login + fail2ban-ban alerts
+F2B_IGNOREIP=""                 # only used when ENV_TYPE=internal
+
+## Kernel & Resource Limits
+SYSCTL_HARDEN="y"
+STRICT_SYSCTL="y"
+DISABLE_COREDUMPS="y"
+BLACKLIST_PROTOCOLS="y"
+
+## Auditing & Compliance
+ENABLE_AUDITD="y"
+CHECK_APPARMOR="y"
+PASSWORD_POLICY="y"
+PW_MINLEN="12"
+JOURNALD_PERSIST="y"
+ENABLE_ROOTKIT="y"
+ENABLE_ACCOUNTING="y"
+
+# Applied automatically, no separate toggle: any NOPASSWD sudoers entry
+# found on the box gets fixed the same way every time.
+FIX_NOPASSWD_SUDOERS="y"
+
+# Comma-separated list of sudoers.d files to leave alone even if they
+# grant NOPASSWD — e.g. package-created helpers scoped to one safe
+# read-only command (ufw/fail2ban status checks) rather than full sudo.
+# Full path or bare filename both work.
+SUDOERS_IGNORE="/etc/sudoers.d/fail2banstatus,/etc/sudoers.d/ufwstatus"
+
+# Fixes locked/passwordless accounts that already have sudo access
+# (e.g. a cloud image's default user). One "username:secret" per line —
+# secret can be plaintext or a crypt hash (starting with $). Any flagged
+# account with no matching entry here is left alone and just warned
+# about, never silently broken.
+SUDO_USER_PASSWORDS=""
+
+## Cleanup
+TMPREAPER_TIME="7d"
+TMPREAPER_EXTRA=""
+LOGROTATE_WEEKS="4"
+
+## Verification
+RUN_DEBSUMS="y"
+RUN_SSHAUDIT="y"
+RUN_LYNIS="y"
