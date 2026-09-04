@@ -41,9 +41,11 @@ CONFIG_FILE=""
 
 print_config_template() {
     cat <<'TEMPLATE'
-# harden.sh config file — sourced as shell, so it's KEY=VALUE, one per
-# line, quoting anything with spaces. Booleans accept y/n (yes/true/1
-# also work). Run with: sudo bash harden.sh --config harden.conf
+# harden.sh config file — KEY=VALUE, one per line, quoting anything with
+# spaces. Values are taken literally (nothing is expanded or executed),
+# so a password hash containing $ is safe to use quoted or unquoted.
+# Booleans accept y/n (yes/true/1 also work).
+# Run with: sudo bash harden.sh --config harden.conf
 #
 # Anything left unset falls back to the same default shown here, so you
 # only need to include the values you want to change from default.
@@ -81,7 +83,7 @@ SSH_CLIENT_ALIVE_INTERVAL="300"
 SSH_CLIENT_ALIVE_COUNT_MAX="2"
 
 ## Firewall
-LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal
+LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal; comma-separate for multiple ranges, e.g. "192.168.1.0/24,10.0.0.0/8"
 UFW_LOGGING="y"
 
 ## Intrusion Prevention
@@ -257,6 +259,42 @@ lookup_sudo_password() {
         fi
     done <<< "${SUDO_USER_PASSWORDS:-}"
     return 1
+}
+
+# load_config_file <path> — reads KEY="value" / KEY='value' / KEY=value
+# lines and assigns them as plain literal strings, with no shell
+# expansion or execution of the value's content at all. Deliberately NOT
+# `source`d as shell: password hashes (yescrypt/bcrypt/SHA-512 all use $
+# as a field separator) would otherwise be parsed as variable references
+# — "$y$j9T$..." un-quoted-safely would either crash under `set -u` or,
+# worse, silently corrupt the hash — and arbitrary shell in a value
+# (e.g. a stray $(...)) would otherwise just execute as root.
+load_config_file() {
+    local file="$1" line line_num=0 key value first_char
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_num=$((line_num+1))
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            first_char="${value:0:1}"
+            if [[ "$first_char" == '"' ]]; then
+                value="${value#\"}"
+                value="${value%%\"*}"
+            elif [[ "$first_char" == "'" ]]; then
+                value="${value#\'}"
+                value="${value%%\'*}"
+            else
+                value="${value%%#*}"
+                value="${value%"${value##*[![:space:]]}"}"
+            fi
+            printf -v "$key" '%s' "$value"
+        else
+            warn "Ignoring unrecognised line $line_num in config: $line"
+        fi
+    done < "$file"
 }
 
 # section <title> — visual divider between the major phases of a run.
@@ -1799,11 +1837,7 @@ main() {
             err "Config file not found: $CONFIG_FILE"
             exit 1
         fi
-        # shellcheck disable=SC1090
-        if ! source "$CONFIG_FILE"; then
-            err "Failed to read config file: $CONFIG_FILE (check it's valid shell — KEY=\"value\" per line)."
-            exit 1
-        fi
+        load_config_file "$CONFIG_FILE"
         info "Loaded config from $CONFIG_FILE — running non-interactively, no prompts."
     else
         # If stdin isn't already a terminal (e.g. this script is being piped

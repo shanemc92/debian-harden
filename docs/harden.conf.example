@@ -1,6 +1,8 @@
-# harden.sh config file — sourced as shell, so it's KEY=VALUE, one per
-# line, quoting anything with spaces. Booleans accept y/n (yes/true/1
-# also work). Run with: sudo bash harden.sh --config harden.conf
+# harden.sh config file — KEY=VALUE, one per line, quoting anything with
+# spaces. Values are taken literally (nothing is expanded or executed),
+# so a password hash containing $ is safe to use quoted or unquoted.
+# Booleans accept y/n (yes/true/1 also work).
+# Run with: sudo bash harden.sh --config harden.conf
 #
 # Anything left unset falls back to the same default shown here, so you
 # only need to include the values you want to change from default.
@@ -38,7 +40,7 @@ SSH_CLIENT_ALIVE_INTERVAL="300"
 SSH_CLIENT_ALIVE_COUNT_MAX="2"
 
 ## Firewall
-LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal
+LAN_CIDRS="192.168.1.0/24"      # only used when ENV_TYPE=internal; comma-separate for multiple ranges, e.g. "192.168.1.0/24,10.0.0.0/8"
 UFW_LOGGING="y"
 
 ## Intrusion Prevention

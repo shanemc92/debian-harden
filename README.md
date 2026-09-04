@@ -105,6 +105,15 @@ shown in the template, so you only need to include what you want to
 change. Combine with `--dry-run` to preview a config file's effect before
 running it for real.
 
+The file is parsed as plain `KEY=value` lines, not executed as real
+shell — a value's content is taken completely literally, with nothing
+expanded or run, whether you quote it, don't quote it, or use single vs
+double quotes. This matters for password hashes: yescrypt, bcrypt and
+SHA-512 hashes all use `$` as a field separator (e.g.
+`$y$j9T$salt$hash`), and none of that is treated specially here. `#`
+starts a comment only outside of quotes, matching the template's own
+style of putting an explanatory comment after the value on the same line.
+
 ### As a one-line snippet (base64)
 
 For pasting into an SSH client's saved-command/snippet feature — where
