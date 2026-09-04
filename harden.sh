@@ -110,6 +110,12 @@ ENABLE_ACCOUNTING="y"
 # found on the box gets fixed the same way every time.
 FIX_NOPASSWD_SUDOERS="y"
 
+# Comma-separated list of sudoers.d files to leave alone even if they
+# grant NOPASSWD — e.g. package-created helpers scoped to one safe
+# read-only command (ufw/fail2ban status checks) rather than full sudo.
+# Full path or bare filename both work.
+SUDOERS_IGNORE="/etc/sudoers.d/fail2banstatus,/etc/sudoers.d/ufwstatus"
+
 # Fixes locked/passwordless accounts that already have sudo access
 # (e.g. a cloud image's default user). One "username:secret" per line —
 # secret can be plaintext or a crypt hash (starting with $). Any flagged
@@ -243,6 +249,20 @@ set_user_password() {
     else
         echo "${user}:${secret}" | chpasswd
     fi
+}
+
+# is_sudoers_ignored <path> — checks SUDOERS_IGNORE (comma or
+# space-separated) for a match against the full path or just the
+# basename, so either "/etc/sudoers.d/ufwstatus" or "ufwstatus" works.
+is_sudoers_ignored() {
+    local target="$1" base entry
+    base="${target##*/}"
+    local list="${SUDOERS_IGNORE:-}"
+    list="${list//,/ }"
+    for entry in $list; do
+        [[ "$entry" == "$target" || "$entry" == "$base" ]] && return 0
+    done
+    return 1
 }
 
 # lookup_sudo_password <user> — searches SUDO_USER_PASSWORDS (one
@@ -732,6 +752,7 @@ gather_config() {
 
     FIX_NOPASSWD_SUDOERS=$(normalize_bool "${FIX_NOPASSWD_SUDOERS:-}" "y")
     SUDO_USER_PASSWORDS="${SUDO_USER_PASSWORDS:-}"
+    SUDOERS_IGNORE="${SUDOERS_IGNORE:-}"
 
     (( NONINTERACTIVE )) || subsection "Cleanup"
     TMPREAPER_TIME="${TMPREAPER_TIME:-7d}"
@@ -827,6 +848,10 @@ audit_sudo_access() {
     files=$(grep -rl "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v '\.harden-bak$' || true)
     for f in $files; do
         [[ -f "$f" ]] || continue
+        if is_sudoers_ignored "$f"; then
+            info "Skipping $f (listed in SUDOERS_IGNORE)."
+            continue
+        fi
         local do_fix="n"
         if (( NONINTERACTIVE )); then
             do_fix="${FIX_NOPASSWD_SUDOERS:-y}"

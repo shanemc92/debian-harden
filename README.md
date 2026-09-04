@@ -138,9 +138,10 @@ too, so treat the base64 blob itself as a secret — anyone who can read
 your shell history or the SSH client's saved snippet can decode it back
 to plaintext.
 
-Two settings exist only for non-interactive use (there's no sensible way
-to prompt for them, since they need to key off usernames the box may
-already have):
+Three settings exist only for non-interactive/config-file use (there's no
+sensible way to prompt for them — they either key off usernames the box
+may already have, or would mean re-asking the same question on every
+single run regardless of answer):
 
 - `NEW_USER_PASSWORD` — sets a password for `NEW_USER` on creation.
   Accepts plaintext or a crypt hash (starting with `$`, e.g. from
@@ -154,6 +155,14 @@ already have):
   passwordless-sudo user). One `username:secret` per line, same
   plaintext-or-hash rule as above. Any flagged account with no matching
   entry here is left alone and just warned about — never silently broken.
+- `SUDOERS_IGNORE` — a comma-separated list of `sudoers.d` files to leave
+  alone even though they grant `NOPASSWD`, for cases where that's
+  actually fine (e.g. a package-created helper scoped to one safe
+  read-only command, like a `ufw status` or `fail2ban-client status`
+  check, rather than full passwordless sudo). Matches either the full
+  path or just the filename. Empty by default; the template pre-fills it
+  with `fail2banstatus` and `ufwstatus` as a starting example — add more
+  as you run into them.
 
 Answer the prompts as they appear. At the end it restarts SSH — **test a
 new connection on the new port before closing your current session.**
