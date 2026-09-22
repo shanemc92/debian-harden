@@ -259,7 +259,7 @@ revert_accounting() {
     echo
     if confirm "Disable process accounting and sysstat?" "n"; then
         systemctl disable --now sysstat &>/dev/null
-        systemctl disable --now acct &>/dev/null 2>/dev/null || service acct stop 2>/dev/null || true
+        systemctl disable --now acct &>/dev/null || service acct stop 2>/dev/null || true
         ok "Process accounting and sysstat disabled."
         note_change
     fi
